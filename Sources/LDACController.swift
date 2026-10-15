@@ -146,8 +146,8 @@ final class LDACController: ObservableObject {
         if driverState != state { driverState = state }
     }
 
-    func installDriver(forAddress address: String) {
-        guard deviceUnavailableReason(forAddress: address) == nil, !isSessionRunning, !isOpeningDriverInstaller else { return }
+    func installDriver() {
+        guard !isSessionRunning, !isOpeningDriverInstaller else { return }
         refreshDriverState()
         guard driverState == .missing || driverState == .outdated else { return }
         openDriverInstaller()
@@ -210,7 +210,7 @@ final class LDACController: ObservableObject {
                 guard driverState == .current else {
                     state = .off
                     targetAddress = nil
-                    installDriver(forAddress: address)
+                    installDriver()
                     return
                 }
             }

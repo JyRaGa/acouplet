@@ -715,9 +715,9 @@ struct LDACDriverGuidance: View {
                      ? String(localized: "LDAC needs an audio driver. Install it, then restart your Mac.")
                      : String(localized: "An LDAC audio driver update is required. Install it, then restart your Mac."))
                 Button(ldac.driverState == .missing ? String(localized: "Install Audio Driver…") : String(localized: "Update Audio Driver…")) {
-                    ldac.installDriver(forAddress: headphones.address)
+                    ldac.installDriver()
                 }
-                .disabled(ldac.isOpeningDriverInstaller || ldac.deviceUnavailableReason(forAddress: headphones.address) != nil)
+                .disabled(ldac.isOpeningDriverInstaller || ldac.isSessionRunning)
                 .buttonStyle(.bordered)
                 .tint(.primary)
                 .accessibilityIdentifier("audio.installDriver")

@@ -303,7 +303,7 @@ enum LDACControllerCleanupCheck {
 
         let manual = Controller()
         LDACDriverInstaller.installations = 0
-        manual.installDriver(forAddress: address)
+        manual.installDriver()
         manual.updateInstalledDriverIfNeeded()
         await waitUntil { !manual.isOpeningDriverInstaller }
         manual.updateInstalledDriverIfNeeded()
@@ -320,7 +320,7 @@ enum LDACControllerCleanupCheck {
         failedUpdate.updateInstalledDriverIfNeeded()
         precondition(LDACDriverInstaller.installations == 1, "Failed automatic update retried itself")
         LDACDriverInstaller.error = nil
-        failedUpdate.installDriver(forAddress: address)
+        failedUpdate.installDriver()
         precondition(failedUpdate.isOpeningDriverInstaller && failedUpdate.driverInstallationError == nil)
         await waitUntil { !failedUpdate.isOpeningDriverInstaller }
         precondition(LDACDriverInstaller.installations == 2, "Automatic failure prevented a manual retry")
@@ -350,13 +350,33 @@ enum LDACControllerCleanupCheck {
             precondition(LDACDriverInstaller.inspections == 0, "Enable inspected driver for \(name)")
             precondition(admission.starts.isEmpty && admission.requestedAddress == nil && admission.targetAddress == nil)
             precondition(admission.requestedConfiguration == LDACConfiguration() && admission.state == .off)
-            admission.installDriver(forAddress: address)
-            precondition(LDACDriverInstaller.inspections == 0, "Installer inspected driver for \(name)")
-            precondition(!admission.isOpeningDriverInstaller && LDACDriverInstaller.installations == 0)
+            admission.installDriver()
+            precondition(LDACDriverInstaller.inspections == 1 && admission.isOpeningDriverInstaller,
+                         "Manual installation required ready controls for \(name)")
+            await waitUntil { !admission.isOpeningDriverInstaller }
+            precondition(LDACDriverInstaller.installations == 1 && admission.starts.isEmpty)
         }
         let missingCoordinator = Controller()
         missingCoordinator.devices = nil
         precondition(missingCoordinator.deviceUnavailableReason(forAddress: address) != nil)
+        for state in [LDACDriverInstaller.State.missing, .outdated, .current, .restartRequired, .unavailable("Untrusted driver")] {
+            LDACDriverInstaller.state = state
+            LDACDriverInstaller.installations = 0
+            missingCoordinator.installDriver()
+            await waitUntil { !missingCoordinator.isOpeningDriverInstaller }
+            precondition(LDACDriverInstaller.installations == (state == .missing || state == .outdated ? 1 : 0),
+                         "Manual installation ignored driver state \(state)")
+        }
+        for running in [false, true] {
+            let busy = Controller()
+            busy.isSessionRunning = running
+            busy.isOpeningDriverInstaller = !running
+            LDACDriverInstaller.inspections = 0
+            LDACDriverInstaller.installations = 0
+            busy.installDriver()
+            precondition(LDACDriverInstaller.inspections == 0 && LDACDriverInstaller.installations == 0,
+                         "Manual installation admitted a busy controller")
+        }
         let idleFinder = Controller()
         idleFinder.devices?.controllers[address]?.earbudFinder = EarbudFinder(isBusy: false, mayBeRinging: false)
         precondition(idleFinder.deviceUnavailableReason(forAddress: address) == nil && idleFinder.canEnable(forAddress: address),
@@ -710,7 +730,7 @@ enum LDACControllerCleanupCheck {
         print("PASS actual LDAC admission, connection preference and cleanup methods: confirmations, readiness, output-before-preference restoration, cancelled startup, user supersession, bounded retry without setter replay, sleep/wake, quit deadline and existing lifecycle checks; fake peers only")
         print("PASS actual disconnect policy: idle waiting, one resume, source/output/selection/driver gates, deferred Stable Connection, manual Off, sleep/wake, cleanup failure and nested-error deduplication")
         print("PASS actual driver update policy: existing outdated driver only, independent of headphones, once per launch, busy/manual deduplication, surfaced errors and manual retry")
-        print("PASS actual finder admission: active finding and unconfirmed Stop block LDAC and manual installation; absent or idle finder allows admission")
+        print("PASS actual finder admission: active finding and unconfirmed Stop block LDAC; manual driver installation is independent of headphones and preserves busy/driver-state checks")
     }
 }
 '''.replace("__METHODS__", "\n".join(method(name) for name in ["needsStopBeforeTermination", "canResumeRecovery", "deviceUnavailableReason", "canEnable", "refreshDriverState", "updateInstalledDriverIfNeeded", "installDriver", "openDriverInstaller", "setEnabled", "stop", "suspend", "resumeIfReady", "reconcileConnectionPreferences", "forgetConnectionPreference", "scheduleConnectionPreferenceRestoration", "stopSession", "prepareConnectionMode", "waitForConnectionChange", "restoreConnectionMode", "restoreConnectionPreference", "finish", "completeStop"]))

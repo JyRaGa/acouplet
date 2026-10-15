@@ -691,9 +691,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private enum Stage { case idle, protocolInfo, supportFunctions, bleIdentity, noiseControl, ready, unsupported }
-    private static let sonyUUIDBytes: [UInt8] = [
-        0x95, 0x6C, 0x7B, 0x26, 0xD4, 0x9A, 0x4B, 0xA8,
-        0xB0, 0x3F, 0xB1, 0x7D, 0x39, 0x3C, 0xB6, 0xE2,
+    private static let sonyUUIDBytes: [[UInt8]] = [
+        [0x95, 0x6C, 0x7B, 0x26, 0xD4, 0x9A, 0x4B, 0xA8,
+         0xB0, 0x3F, 0xB1, 0x7D, 0x39, 0x3C, 0xB6, 0xE2],
+        [0x96, 0xCC, 0x20, 0x3E, 0x50, 0x68, 0x46, 0xAD,
+         0xB3, 0x2D, 0xE3, 0x16, 0xF5, 0xE0, 0x69, 0xBA],
     ]
     private static let asmByFunction: [(function: UInt8, type: UInt8)] = [
         (0x6D, 0x19), (0x6B, 0x17), (0x68, 0x15), (0x67, 0x22), (0x66, 0x21),
@@ -709,6 +711,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var classicConnections: [UUID: ClassicConnection] = [:]
     private var serviceDiscoveryID: UUID?
     private var serviceDiscoveries: [UUID: ServiceDiscovery] = [:]
+    private var cachedServiceOpenIsAutomatic: Bool?
     var pairedDeviceInventory: [any SonyBluetoothDevice]?
     private var channel: (any RFCOMMChannel)?
     private var channelIO: RFCOMMChannelIO?
@@ -4502,10 +4505,17 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             return
         }
         pendingClassicOpenID = nil
-        let uuid = Self.sonyUUIDBytes.withUnsafeBytes {
-            IOBluetoothSDPUUID(bytes: $0.baseAddress!, length: Self.sonyUUIDBytes.count)
+        var record: (any SonyServiceRecord)?
+        for bytes in Self.sonyUUIDBytes {
+            let uuid = bytes.withUnsafeBytes {
+                IOBluetoothSDPUUID(bytes: $0.baseAddress!, length: bytes.count)
+            }
+            if let found = device.sonyServiceRecord(for: uuid) {
+                record = found
+                break
+            }
         }
-        guard let record = device.sonyServiceRecord(for: uuid) else {
+        guard let record else {
             if discoverServices {
                 discoverSonyService(on: device, automatically: automatically)
             } else {
@@ -4518,6 +4528,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             fail(String(localized: "Could not open the headphones’ Bluetooth control connection."))
             return
         }
+        cachedServiceOpenIsAutomatic = discoverServices ? automatically : nil
         let (result, openedChannel) = device.openSonyRFCOMMChannel(withChannelID: channelID, delegate: self)
         channel = openedChannel
         if let openedChannel { channelIO = RFCOMMChannelIO(channel: openedChannel) }
@@ -4598,6 +4609,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         classicConnectionID = nil
         pendingClassicOpenID = nil
         serviceDiscoveryID = nil
+        cachedServiceOpenIsAutomatic = nil
         announcedAudioSourceAddress = nil
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         nativeAppearanceRefresh?.stop()
@@ -4820,7 +4832,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         let timeout = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, self.handshakeID == identifier else { return }
-                self.fail(String(localized: "The headphones did not respond."))
+                if self.linkState == .opening, self.cachedServiceOpenIsAutomatic != nil {
+                    self.handleOpenFailure(kIOReturnTimeout)
+                } else {
+                    self.fail(String(localized: "The headphones did not respond."))
+                }
             }
         }
         handshakeTimeoutWorkItem = timeout
@@ -7451,7 +7467,15 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private func handleOpenFailure(_ error: IOReturn) {
         let message = String(localized: "Could not open the headphone connection. Try again.")
         Self.logger.error("Could not open headphone connection; status=\(error)")
+        let automatically = cachedServiceOpenIsAutomatic
         closeSonyLink()
+        if let automatically, let device {
+            stage = .protocolInfo
+            linkState = .opening
+            scheduleHandshakeTimeout()
+            discoverSonyService(on: device, automatically: automatically)
+            return
+        }
         linkState = .controlBusy
         lastErrorMessage = message
         scheduleRetry()
@@ -7627,6 +7651,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             handleOpenFailure(error)
             return
         }
+        cachedServiceOpenIsAutomatic = nil
         channel = rfcommChannel
         beginHandshake()
     }
