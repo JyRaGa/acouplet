@@ -3,6 +3,71 @@ import XCTest
 
 final class SonyLegacyOptimizerControllerTests: XCTestCase {
     @MainActor
+    func testEndAndMeasurementsInOneReadCannotCompleteNewResultQuery() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            _ = try run(controller)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frames = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: ended)
+                + SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: measurements)
+            controller.defersSimulatedWrites = deferred
+            controller.simulateProtocolData(frames)
+            controller.defersSimulatedWrites = false
+            if deferred {
+                controller.completeSimulatedWrite()
+                controller.completeSimulatedWrite()
+                controller.completeSimulatedWrite()
+            }
+            XCTAssertEqual(controller.legacyOptimizerTransition?.phase, .readingResult)
+            XCTAssertNil(controller.legacyOptimizerTransition?.result)
+            try acknowledge(SonyLegacyOptimizer.measurementsQuery, on: controller)
+            deliver(measurements, to: controller)
+            XCTAssertEqual(controller.legacyOptimizerTransition?.phase, .completed)
+        }
+    }
+
+    @MainActor
+    func testCancellationRejectsFrameStartedBeforeExitTransmission() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            let id = try run(controller)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frame = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x85, 1, 0, 0])
+            controller.simulateProtocolData(frame.prefix(4))
+            controller.defersSimulatedWrites = deferred
+            controller.cancelLegacyOptimizer(id: id)
+            controller.defersSimulatedWrites = false
+            if deferred { controller.completeSimulatedWrite() }
+            controller.simulateProtocolData(frame.dropFirst(4))
+            XCTAssertEqual(controller.legacyOptimizerTransition?.phase, .cancelling)
+            deliver([0x85, 1, 0, 0], to: controller)
+            XCTAssertEqual(controller.legacyOptimizerTransition?.phase, .cancelled)
+        }
+    }
+
+    @MainActor
+    func testDiscoveryRejectsFrameStartedBeforeQueryTransmission() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frame = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: initialReplies[0])
+            controller.simulateProtocolData(frame.prefix(4))
+            controller.defersSimulatedWrites = deferred
+            XCTAssertTrue(controller.beginLegacyOptimizer())
+            controller.defersSimulatedWrites = false
+            if deferred { controller.completeSimulatedWrite() }
+            controller.simulateProtocolData(frame.dropFirst(4))
+            XCTAssertEqual(controller.legacyOptimizerTransition?.phase, .checking)
+            XCTAssertNil(controller.legacyOptimizer.capability)
+            deliver(initialReplies[0], to: controller)
+            XCTAssertNotNil(controller.legacyOptimizer.capability)
+        }
+    }
+
+    @MainActor
     func testFreshOwnedDiscoveryRequiresExplicitStartAndFinalAcknowledgment() throws {
         let controller = readyController()
         defer { controller.simulateControlLoss() }

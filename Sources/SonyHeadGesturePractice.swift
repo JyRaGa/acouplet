@@ -73,7 +73,8 @@ struct SonyHeadGesturePracticeTransition: Equatable {
     private(set) var message: String?
     private(set) var commandTransmitted = false
     private(set) var dismissWhenFinished = false
-    private var queryTransmitted = false
+    private var queryTransmissionOrdinal: UInt64?
+    private var commandTransmissionOrdinal: UInt64?
     private var closing = false
     private var ordinaryAvailable = true
 
@@ -92,24 +93,28 @@ struct SonyHeadGesturePracticeTransition: Equatable {
 
     var waitingForReport: Bool {
         switch phase {
-        case .checking: queryTransmitted
+        case .checking: queryTransmissionOrdinal != nil
         case .entering, .leaving: commandTransmitted
         default: false
         }
     }
 
-    mutating func transmitted(_ payload: [UInt8], session: UInt64) {
+    mutating func transmitted(_ payload: [UInt8], session: UInt64, transmissionOrdinal: UInt64 = 0) {
         guard self.session == session else { return }
         if phase == .checking, payload == SonyHeadGesturePractice.queryPayload {
-            queryTransmitted = true
+            queryTransmissionOrdinal = transmissionOrdinal
         } else if payload == expectedPayload {
             commandTransmitted = true
+            commandTransmissionOrdinal = transmissionOrdinal
         }
     }
 
-    func accepts(_ payload: [UInt8], session: UInt64) -> Bool {
+    func accepts(_ payload: [UInt8], session: UInt64, transmissionOrdinal: UInt64 = .max) -> Bool {
         guard self.session == session, payload.count >= 2, payload[1] == 0x10 else { return false }
-        if phase == .checking { return payload[0] == 0xF5 || (queryTransmitted && payload[0] == 0xF3) }
+        if phase == .checking {
+            return payload[0] == 0xF5 || (payload[0] == 0xF3 && queryTransmissionOrdinal.map { transmissionOrdinal >= $0 } == true)
+        }
+        if phase != .ready, let commandTransmissionOrdinal, transmissionOrdinal < commandTransmissionOrdinal { return false }
         if payload[0] == 0xF9 { return phase == .practicing }
         return payload[0] == 0xF5 && [.ready, .entering, .practicing, .leaving].contains(phase)
     }
@@ -219,5 +224,6 @@ struct SonyHeadGesturePracticeTransition: Equatable {
     private mutating func move(to phase: Phase) {
         self.phase = phase
         commandTransmitted = false
+        if expectedPayload != nil { commandTransmissionOrdinal = nil }
     }
 }

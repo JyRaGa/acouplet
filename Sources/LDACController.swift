@@ -7,13 +7,30 @@ import OSLog
 
 @MainActor
 final class LDACController: ObservableObject {
-    @Published private(set) var state: LDACState = .off
+    @Published private(set) var state: LDACState = .off {
+        didSet {
+            guard oldValue != state else { return }
+            if case let .failed(message) = state {
+                record("failed", reason: message)
+            } else {
+                record("state", reason: diagnosticState)
+            }
+        }
+    }
     @Published private(set) var targetAddress: String?
     @Published private(set) var isSessionRunning = false
     @Published private(set) var isRecovering = false
     @Published private(set) var audioCaptureAccess: LDACAudioCaptureAccess = .unchecked
-    @Published private(set) var driverState: LDACDriverInstaller.State
-    @Published private(set) var driverInstallationError: String?
+    @Published private(set) var driverState: LDACDriverInstaller.State {
+        didSet {
+            if oldValue != driverState { record("driver", reason: String(describing: driverState)) }
+        }
+    }
+    @Published private(set) var driverInstallationError: String? {
+        didSet {
+            if let driverInstallationError { record("driver-install-failed", reason: driverInstallationError) }
+        }
+    }
     @Published private(set) var isOpeningDriverInstaller = false
     private var didAttemptAutomaticDriverUpdate = false
     private let bundle: Bundle
@@ -25,6 +42,9 @@ final class LDACController: ObservableObject {
     private let isClassicConnected: (String) -> Bool
     private var session: LDACOwnerSession?
     private var sessionID = UUID()
+    private var diagnosticAttempt = 0
+    private var diagnosticHistory = DiagnosticHistory()
+    private var lastNativeFailure: (attempt: Int, message: String)?
     private var requestedAddress: String?
     private var requestedConfiguration = LDACConfiguration()
     private var nativeOutput: LDACOwnerOutput?
@@ -335,6 +355,7 @@ final class LDACController: ObservableObject {
     }
 
     private func start(_ address: String) {
+        diagnosticAttempt += 1
         sessionID = UUID()
         state = .requested
         targetAddress = address
@@ -364,6 +385,7 @@ final class LDACController: ObservableObject {
                 }
                 if self.usable { self.setOutputGain(controls.muted ? 0 : 1) }
             case let .failure(error):
+                self.recordOutputFailure(error)
                 if error is LDACPriorityCleanupError, let session = self.session,
                    self.requestedAddress == self.targetAddress {
                     self.beginRecovery(reason: error.localizedDescription)
@@ -430,6 +452,7 @@ final class LDACController: ObservableObject {
                 self.finish(nil)
             } catch {
                 guard self.sessionID == identifier else { return }
+                self.recordOutputFailure(error)
                 self.record("start-failed", reason: "\(error.localizedDescription); \(self.musicControlStatus)")
                 self.startTask = nil
                 if self.devices?.isSystemSleeping == true || self.headphones?.isDeviceConnected == false {
@@ -443,13 +466,28 @@ final class LDACController: ObservableObject {
         }
     }
 
-    private func prepareConnectionMode(_ headphones: SonyHeadphonesController, address: String, identifier: UUID) async throws {
+    private func prepareConnectionMode(_ headphones: SonyHeadphonesController, address: String, identifier: UUID,
+                                       timeout: TimeInterval = 15) async throws {
         try Task.checkCancellation()
         guard headphones.connectionTransition?.isFinished != false else {
             throw ControlError(String(localized: "Finish the current connection change before starting LDAC."))
         }
         guard headphones.supportsConnectionMode else { return }
-        if headphones.connectionMode == .soundQuality { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            try Task.checkCancellation()
+            guard sessionID == identifier, requestedAddress == address, state != .stopping else { throw CancellationError() }
+            guard devices?.controller(for: address) === headphones else {
+                throw ControlError(String(localized: "The headphone connection changed. Try LDAC again."))
+            }
+            guard headphones.connectionTransition?.isFinished != false else {
+                throw ControlError(String(localized: "Finish the current connection change before starting LDAC."))
+            }
+            if headphones.connectionMode == .soundQuality { return }
+            guard let reason = headphones.connectionModeUnavailableReason(.soundQuality) else { break }
+            guard Date() < deadline else { throw ControlError(reason) }
+            try await Task.sleep(for: .milliseconds(100))
+        }
         let original = headphones.connectionMode
         let previous = headphones.lastConnectionModeChangeID
         headphones.setConnectionMode(.soundQuality)
@@ -604,6 +642,8 @@ final class LDACController: ObservableObject {
                                        recoveryAttempt: isRecovering, restoringOnly: restoringOnly) { [weak self] event in
             guard let self, self.session?.id == identifier else { return }
             switch event {
+            case let .diagnostic(diagnostic):
+                self.recordNativeDiagnostic(diagnostic)
             case .handoffReady:
                 self.record("handoff-ready", reason: self.musicControlStatus)
                 guard self.state != .stopping else { return }
@@ -641,6 +681,7 @@ final class LDACController: ObservableObject {
                         self.state = .connecting
                     } catch is CancellationError {
                     } catch {
+                        if self.sessionID == identifier { self.recordOutputFailure(error) }
                         if self.devices?.isSystemSleeping == true || self.headphones?.isDeviceConnected == false {
                             self.suspend(restoreAudio: false, reason: "headphones disconnected during handoff")
                         } else { self.fail(error.localizedDescription) }
@@ -806,6 +847,7 @@ final class LDACController: ObservableObject {
             } catch is CancellationError {
             } catch {
                 guard self.sessionID == identifier else { return }
+                self.recordOutputFailure(error)
                 if error is ControlError, self.isRecovering, !self.hasOtherMusicSource {
                     self.beginRecovery(reason: error.localizedDescription)
                     self.session?.recoverConnection(reason: error.localizedDescription)
@@ -891,6 +933,7 @@ final class LDACController: ObservableObject {
             } catch is CancellationError {
             } catch {
                 guard self.sessionID == identifier, self.volumeTaskID == volumeIdentifier else { return }
+                self.recordOutputFailure(error)
                 if !self.bindingIsCurrent, !self.hasOtherMusicSource, self.state != .stopping {
                     self.beginRecovery(reason: error.localizedDescription)
                     self.session?.recoverConnection(reason: error.localizedDescription)
@@ -992,6 +1035,7 @@ final class LDACController: ObservableObject {
             } catch is CancellationError {
             } catch {
                 guard let self, self.sessionID == identifier else { return }
+                self.recordOutputFailure(error)
                 self.recoveryTask = nil
                 self.fail(error.localizedDescription)
             }
@@ -1095,7 +1139,64 @@ final class LDACController: ObservableObject {
         }
     }
 
+    private var diagnosticState: String {
+        switch state {
+        case .off: "off"
+        case .requested: "requested"
+        case .connecting: "connecting"
+        case .waitingForDevice: "waiting for device"
+        case let .active(format): "active; \(format)"
+        case .stopping: "stopping"
+        case .failed: "failed"
+        }
+    }
+
+    private var diagnosticMusicControlStatus: String {
+        let volume = headphones?.playback.volume.map(String.init) ?? "unknown"
+        let range = headphones?.playback.musicVolumeRange.map { "\($0.lowerBound)...\($0.upperBound)" } ?? "unknown"
+        return "ready=\(headphones?.isReady == true) owned=\(hasOwnedMusicContext) fresh=\(headphones?.hasFreshMusicVolumeReadback == true) writable=\(headphones?.canControlMusicVolume == true) volume=\(volume) range=\(range) pending=\(pendingVolume.map(String.init) ?? "none") writing=\(volumeTask != nil)"
+    }
+
+    var diagnosticReport: String {
+        let names = (headphones?.diagnosticPrivateNames ?? []) + [audioRoute?.route?.name ?? ""]
+        let lines = [
+            "Current LDAC snapshot:",
+            "LDAC state: \(diagnosticState)",
+            "LDAC attempt: \(diagnosticAttempt)",
+            "LDAC target: \(targetAddress == nil ? "None" : "Selected; identity omitted")",
+            "LDAC session running: \(isSessionRunning); recovering: \(isRecovering); retry: \(recoveryAttempt)",
+            "LDAC driver: \(driverState)",
+            "LDAC driver installation issue: \(driverInstallationError ?? "None")",
+            "LDAC audio capture: \(audioCaptureAccess)",
+            "LDAC configuration: \(requestedConfiguration.sampleRate.rawValue) Hz; quality=\(requestedConfiguration.quality)",
+            "LDAC cleanup pending: \(cleanupTask != nil); preference restores: \(preferenceRestoreTasks.count)",
+            "LDAC music controls: \(diagnosticMusicControlStatus)",
+            "LDAC current volume issue: \(volumeError ?? "None")",
+            "LDAC last native failure (may be from an earlier attempt): \(lastNativeFailure?.message ?? "None")",
+        ]
+        return lines.map { DiagnosticHistory.line($0, redacting: names) }.joined(separator: "\n")
+            + "\n\nLDAC history\n" + diagnosticHistory.report
+    }
+
+    func recordOutputFailure(_ error: Error) {
+        if let diagnostic = (error as? LDACOwnerError)?.diagnostic ?? (error as? LDACPriorityCleanupError)?.diagnostic {
+            recordNativeDiagnostic(diagnostic)
+        }
+    }
+
+    func recordNativeDiagnostic(_ diagnostic: LDACNativeSession.Diagnostic) {
+        record("native \(diagnostic.stage)", reason: diagnostic.detail)
+        if diagnostic.isFailure, lastNativeFailure?.attempt != diagnosticAttempt {
+            let message = DiagnosticHistory.line("attempt=\(diagnosticAttempt) stage=\(diagnostic.stage); \(diagnostic.detail)",
+                                                 redacting: (headphones?.diagnosticPrivateNames ?? []) + [audioRoute?.route?.name ?? ""])
+            lastNativeFailure = (diagnosticAttempt, message)
+        }
+    }
+
     private func record(_ event: String, reason: String) {
+        let detail = reason.replacingOccurrences(of: musicControlStatus, with: diagnosticMusicControlStatus)
+        diagnosticHistory.record("attempt=\(diagnosticAttempt) \(event); \(detail)", failure: event.contains("failed"),
+                                 redacting: (headphones?.diagnosticPrivateNames ?? []) + [audioRoute?.route?.name ?? ""])
         Self.logger.notice("LDAC controller \(event, privacy: .public); target=\(self.targetAddress ?? "none", privacy: .private(mask: .hash)) session=\(self.sessionID.uuidString, privacy: .public) reason=\(reason, privacy: .private)")
     }
 

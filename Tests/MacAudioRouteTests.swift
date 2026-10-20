@@ -6,22 +6,22 @@ import XCTest
 
 final class MacAudioRouteTests: XCTestCase {
     #if !ACOUPLET_PUBLIC_APIS_ONLY
-    func testLDACLogPredicateRetainsOwnershipEventsAndRejectsUnrelatedTraffic() {
-        let predicate = NSPredicate(format: LDACNativeSession.daemonPredicate)
-        for message in [
-            "connectedCB cid:0x0040 inMTU:100 outMTU:100 result:0",
-            "l2capDisconnected for CID: 0x0040",
-            "l2capDataInd for CID: 0x0040, len: 0x0002",
-            "ACL connected: 02-00-00-00-00-01, result 0",
-            "Received connection result for \"A2DP Source\" profile on device 02-00-00-00-00-01 result was 0"
-        ] {
-            XCTAssertTrue(predicate.evaluate(with: ["process": "bluetoothd", "eventMessage": message]))
-            XCTAssertTrue(predicate.evaluate(with: ["process": "bluetoothd", "eventMessage": message.uppercased()]))
-            XCTAssertFalse(predicate.evaluate(with: ["process": "unrelated", "eventMessage": message]))
-        }
-        for message in ["PipeMgr: Write completed", "Advertising state changed", "Device scan result"] {
-            XCTAssertFalse(predicate.evaluate(with: ["process": "bluetoothd", "eventMessage": message]))
-        }
+    func testLDACOwnedChannelRequiresMatchingCallbacks() throws {
+        var channel = LDACChannelGate()
+        try channel.owned("connectedCB cid:0x0040 inMTU:100 outMTU:100 result:0")
+        XCTAssertFalse(channel.opened)
+        XCTAssertThrowsError(try channel.owned("OWNED_CLOSED CID=0040"))
+        XCTAssertThrowsError(try channel.owned("OWNED_OPEN CID=0000 outgoingMTU=100"))
+        XCTAssertThrowsError(try channel.owned("OWNED_OPEN CID=0040 outgoingMTU=1"))
+        try channel.owned("OWNED_OPEN CID=0040 outgoingMTU=100")
+        XCTAssertEqual(channel.cid, 0x40)
+        XCTAssertEqual(channel.mtu, 100)
+        XCTAssertTrue(channel.opened)
+        XCTAssertThrowsError(try channel.owned("OWNED_OPEN CID=0040 outgoingMTU=100"))
+        XCTAssertThrowsError(try channel.owned("OWNED_CLOSED CID=0041"))
+        try channel.owned("OWNED_CLOSED CID=0040")
+        XCTAssertTrue(channel.closed)
+        XCTAssertThrowsError(try channel.owned("OWNED_CLOSED CID=0040"))
     }
 
     func testLDACChildDrainsFinalOutputAfterProcessExit() throws {

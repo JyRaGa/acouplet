@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 REPO = Path(__file__).resolve().parent.parent
 SPARKLE = REPO / '.build/Sparkle-2.10.0/bin'
 PREFIX = 'https://baglayan.dev/updates/'
+HISTORY_URL = 'https://baglayan.dev/acouplet/history/'
 NS = '{http://www.andymatuschak.org/xml-namespaces/sparkle}'
 PUBLIC_METADATA = ['version', 'build', 'initializeFeed', 'sdkVersion', 'architecture', 'githubRepository']
 
@@ -154,7 +155,8 @@ def feed(root, *, app, archive, notes, history, account):
             if path.exists():
                 shutil.copy2(path, generated / path.name)
         run([SPARKLE / 'generate_appcast', '--account', account, '--download-url-prefix', download_prefix,
-             '--release-notes-url-prefix', PREFIX, '--disable-signing-warning', '--maximum-versions', '0', '--maximum-deltas', '0', generated], capture=True)
+             '--release-notes-url-prefix', PREFIX, '--full-release-notes-url', HISTORY_URL,
+             '--disable-signing-warning', '--maximum-versions', '0', '--maximum-deltas', '0', generated], capture=True)
         shutil.copy2(generated / 'appcast.xml', updates / 'appcast.xml')
     verify_updates(root, updates, public_key, metadata['build'], metadata['version'], repository=repository)
     artifact = root / 'publish'

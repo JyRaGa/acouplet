@@ -37,10 +37,54 @@ struct SonyBLEWriteBuffer {
 }
 
 @MainActor
+protocol SonyBLEPeripheral: AnyObject {
+    var identifier: UUID { get }
+    var name: String? { get }
+    var delegate: (any CBPeripheralDelegate)? { get set }
+    var services: [CBService]? { get }
+    var canSendWriteWithoutResponse: Bool { get }
+    func discoverServices(_ serviceUUIDs: [CBUUID]?)
+    func discoverCharacteristics(_ characteristicUUIDs: [CBUUID]?, for service: CBService)
+    func readValue(for characteristic: CBCharacteristic)
+    func setNotifyValue(_ enabled: Bool, for characteristic: CBCharacteristic)
+    func maximumWriteValueLength(for type: CBCharacteristicWriteType) -> Int
+    func writeValue(_ data: Data, for characteristic: CBCharacteristic, type: CBCharacteristicWriteType)
+}
+
+extension CBPeripheral: SonyBLEPeripheral {}
+
+@MainActor
+protocol SonyBLECentral: AnyObject {
+    var state: CBManagerState { get }
+    var isScanning: Bool { get }
+    var delegate: (any CBCentralManagerDelegate)? { get set }
+    func savedPeripherals(withIdentifiers identifiers: [UUID]) -> [any SonyBLEPeripheral]
+    func scanForPeripherals(withServices serviceUUIDs: [CBUUID]?, options: [String: Any]?)
+    func stopScan()
+    func connectPeripheral(_ peripheral: any SonyBLEPeripheral)
+    func cancelConnection(_ peripheral: any SonyBLEPeripheral)
+}
+
+extension CBCentralManager: SonyBLECentral {
+    func savedPeripherals(withIdentifiers identifiers: [UUID]) -> [any SonyBLEPeripheral] {
+        retrievePeripherals(withIdentifiers: identifiers)
+    }
+
+    func connectPeripheral(_ peripheral: any SonyBLEPeripheral) {
+        connect(peripheral as! CBPeripheral, options: nil)
+    }
+
+    func cancelConnection(_ peripheral: any SonyBLEPeripheral) {
+        cancelPeripheralConnection(peripheral as! CBPeripheral)
+    }
+}
+
+@MainActor
 final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate, @preconcurrency CBPeripheralDelegate {
     var onReady: ((UUID, String?) -> Void)?
     var onData: ((Data) -> Void)?
     var onDisconnect: ((String?) -> Void)?
+    var onDiagnostic: ((String) -> Void)?
     private(set) var diagnosticError: String?
     private(set) var isReady = false
     private(set) var isWaitingForConnection = false
@@ -50,12 +94,13 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
     private static let writeUUID = CBUUID(string: "5B833C60-6BC7-4802-8E9A-723CECA4BD8F")
     private static let notifyUUID = CBUUID(string: "5B833C61-6BC7-4802-8E9A-723CECA4BD8F")
     private static let lengthUUID = CBUUID(string: "5B833C91-6BC7-4802-8E9A-723CECA4BD8F")
-    private var manager: CBCentralManager?
-    private var peripheral: CBPeripheral?
+    private var manager: (any SonyBLECentral)?
+    private var peripheral: (any SonyBLEPeripheral)?
     private var connectionTarget: SonyBLEIdentity.ConnectionTarget?
     private var expectedModel: SonyDeviceModel = .unknown
     private var deviceName: String?
-    private var candidates: [UUID: (CBPeripheral, String)] = [:]
+    private var connectionStage = "starting"
+    private var candidates: [UUID: (any SonyBLEPeripheral, String?)] = [:]
     private var writeCharacteristic: CBCharacteristic?
     private var notifyCharacteristic: CBCharacteristic?
     private var lengthCharacteristic: CBCharacteristic?
@@ -65,12 +110,20 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
     private var isDraining = false
     private var sessionID: UUID?
     private var setupTimeout: Task<Void, Never>?
+    private let makeCentral: (any CBCentralManagerDelegate) -> any SonyBLECentral
+    private var isTryingSavedIdentifier = false
+    private var hasRetriedVerifiedIdentity = false
     private let waitsForConnection: Bool
+    private let deviceWasConnected: Bool
     private var selectionTask: Task<Void, Never>?
     private var writeTimeout: Task<Void, Never>?
 
-    init(waitForConnection: Bool) {
+    init(waitForConnection: Bool, isDeviceConnected: Bool = false, makeCentral: @escaping (any CBCentralManagerDelegate) -> any SonyBLECentral = {
+        CBCentralManager(delegate: $0, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false])
+    }) {
+        self.makeCentral = makeCentral
         waitsForConnection = waitForConnection
+        deviceWasConnected = isDeviceConnected
         super.init()
     }
 
@@ -83,8 +136,18 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         fail(message)
     }
 
-    func simulateWaitingForConnection() {
-        isWaitingForConnection = true
+    func simulateWaitingForConnection(_ waiting: Bool = true) {
+        isWaitingForConnection = waiting
+    }
+
+    var simulatedSetupTimeout: (() -> Void)? {
+        guard setupTimeout != nil, let sessionID else { return nil }
+        return { [weak self] in self?.setupTimedOut(session: sessionID) }
+    }
+
+    var simulatedSelection: (() -> Void)? {
+        guard selectionTask != nil, let sessionID, let manager else { return nil }
+        return { [weak self] in self?.selectCandidate(session: sessionID, central: manager) }
     }
     #endif
 
@@ -107,7 +170,8 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         expectedModel = model
         connectionTarget = target
         sessionID = UUID()
-        manager = CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false])
+        recordStage("starting")
+        manager = makeCentral(self)
         scheduleSetupTimeout()
     }
 
@@ -115,12 +179,16 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         setupTimeout?.cancel()
         setupTimeout = nil
         guard let id = sessionID,
-              let duration = Self.setupTimeoutDuration(waitForConnection: waitsForConnection, isWaitingForConnection: isWaitingForConnection) else { return }
+              let duration = Self.setupTimeoutDuration(waitForConnection: waitsForConnection && !(isTryingSavedIdentifier && deviceWasConnected) && !hasRetriedVerifiedIdentity, isWaitingForConnection: isWaitingForConnection) else { return }
         setupTimeout = Task { [weak self] in
             do { try await Task.sleep(for: duration) } catch { return }
-            guard let self, self.sessionID == id, !self.isReady else { return }
-            self.fail(String(localized: "The headphone connection timed out. Try again."))
+            self?.setupTimedOut(session: id)
         }
+    }
+
+    private func setupTimedOut(session: UUID) {
+        guard sessionID == session, !isReady else { return }
+        fail(String(localized: "The headphone connection timed out. Try again."))
     }
 
     func stop() {
@@ -135,11 +203,13 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         isWaitingForConnection = false
         if manager?.isScanning == true { manager?.stopScan() }
         peripheral?.delegate = nil
-        if let peripheral { manager?.cancelPeripheralConnection(peripheral) }
+        if let peripheral { manager?.cancelConnection(peripheral) }
         manager?.delegate = nil
         manager = nil
         peripheral = nil
         connectionTarget = nil
+        isTryingSavedIdentifier = false
+        hasRetriedVerifiedIdentity = false
         deviceName = nil
         candidates.removeAll()
         writeCharacteristic = nil
@@ -164,16 +234,19 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         return true
     }
 
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    func handleCentralState(_ central: any SonyBLECentral) {
         guard central === manager else { return }
         switch central.state {
         case .poweredOn:
             guard peripheral == nil, !central.isScanning else { return }
-            if let preferredIdentifier = connectionTarget?.peripheralIdentifier,
-               let target = central.retrievePeripherals(withIdentifiers: [preferredIdentifier]).first {
+            if !hasRetriedVerifiedIdentity, let preferredIdentifier = connectionTarget?.peripheralIdentifier,
+               let target = central.savedPeripherals(withIdentifiers: [preferredIdentifier]).first {
+                if case .verified = connectionTarget { isTryingSavedIdentifier = true }
+                onDiagnostic?("LE selection: saved peripheral")
                 connect(target, name: target.name, central: central)
                 return
             }
+            recordStage("scanning")
             central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         case .poweredOff:
             fail(String(localized: "Bluetooth is turned off."))
@@ -188,80 +261,92 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         }
     }
 
-    func centralManager(_ central: CBCentralManager, didDiscover target: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+    func handleCentral(_ central: any SonyBLECentral, didDiscover target: any SonyBLEPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard central === manager, peripheral == nil, let connectionTarget else { return }
         if case .paired(let identifier) = connectionTarget {
             guard target.identifier == identifier else { return }
+            onDiagnostic?("LE selection: paired peripheral")
             connect(target, name: target.name, central: central)
             return
         }
         guard case .verified(let expectedHash, _) = connectionTarget,
               let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
               let advertisement = SonyBLEIdentity.advertisement(from: data),
-              advertisement.supportsGATT, advertisement.hash == expectedHash,
-              let name = Self.matchingName(peripheralName: target.name, advertisedName: advertisementData[CBAdvertisementDataLocalNameKey] as? String, model: expectedModel) else { return }
+              advertisement.supportsGATT, advertisement.hash == expectedHash else { return }
+        let name = Self.matchingName(peripheralName: target.name, advertisedName: advertisementData[CBAdvertisementDataLocalNameKey] as? String, model: expectedModel)
         candidates[target.identifier] = (target, name)
         guard selectionTask == nil, let id = sessionID else { return }
         selectionTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(1)) } catch { return }
-            guard let self, self.sessionID == id, let central = self.manager else { return }
-            self.selectionTask = nil
-            guard self.candidates.count == 1, let (target, name) = self.candidates.values.first else {
-                self.fail(String(localized: "Multiple headphones were found. Select the headphones you want to connect."))
-                return
-            }
-            self.candidates.removeAll()
-            self.connect(target, name: name, central: central)
+            self?.selectCandidate(session: id, central: central)
         }
     }
 
-    private func connect(_ target: CBPeripheral, name: String?, central: CBCentralManager) {
+    private func selectCandidate(session: UUID, central: any SonyBLECentral) {
+        guard sessionID == session, central === manager, peripheral == nil else { return }
+        selectionTask?.cancel()
+        selectionTask = nil
+        guard candidates.count == 1, let (target, name) = candidates.values.first else {
+            fail(String(localized: "Multiple headphones were found. Select the headphones you want to connect."))
+            return
+        }
+        candidates.removeAll()
+        onDiagnostic?("LE selection: unique verified hash")
+        connect(target, name: name, central: central)
+    }
+
+    private func connect(_ target: any SonyBLEPeripheral, name: String?, central: any SonyBLECentral) {
         central.stopScan()
         peripheral = target
         deviceName = name
         target.delegate = self
         isWaitingForConnection = true
+        recordStage("connecting")
         scheduleSetupTimeout()
-        central.connect(target, options: nil)
+        central.connectPeripheral(target)
     }
 
-    func centralManager(_ central: CBCentralManager, didConnect target: CBPeripheral) {
+    func handleCentral(_ central: any SonyBLECentral, didConnect target: any SonyBLEPeripheral) {
         guard central === manager, target === peripheral else { return }
         isWaitingForConnection = false
         scheduleSetupTimeout()
+        recordStage("discovering GATT service")
         target.discoverServices([Self.serviceUUID])
     }
 
-    func centralManager(_ central: CBCentralManager, didFailToConnect target: CBPeripheral, error: Error?) {
+    func handleCentral(_ central: any SonyBLECentral, didFailToConnect target: any SonyBLEPeripheral, error: Error?) {
         guard central === manager, target === peripheral else { return }
         if let error { fail(error) }
         else { fail(String(localized: "Could not connect to the headphone controls. Try again.")) }
     }
 
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral target: CBPeripheral, error: Error?) {
+    func handleCentral(_ central: any SonyBLECentral, didDisconnectPeripheral target: any SonyBLEPeripheral, error: Error?) {
         guard central === manager, target === peripheral else { return }
+        onDiagnostic?("LE \(connectionStage) disconnected: \(error.map(Self.diagnosticDescription) ?? "no framework error")")
+        if retryVerifiedIdentity() { return }
         let message = error.map { _ in String(localized: "The connection to the headphones was lost.") }
         diagnosticError = error.map(Self.diagnosticDescription)
         stop()
         onDisconnect?(message)
     }
 
-    func peripheral(_ target: CBPeripheral, didDiscoverServices error: Error?) {
+    func handlePeripheral(_ target: any SonyBLEPeripheral, didDiscoverServices error: Error?) {
         guard target === peripheral else { return }
         if let error { fail(error); return }
         guard let service = target.services?.first(where: { $0.uuid == Self.serviceUUID }) else {
             fail(String(localized: "The headphone controls are unavailable through this connection."))
             return
         }
+        recordStage("discovering GATT characteristics")
         target.discoverCharacteristics([Self.writeUUID, Self.notifyUUID, Self.lengthUUID], for: service)
     }
 
-    func peripheral(_ target: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+    func handlePeripheral(_ target: any SonyBLEPeripheral, didModifyServices invalidatedServices: [CBService]) {
         guard target === peripheral, invalidatedServices.contains(where: { $0.uuid == Self.serviceUUID }) else { return }
         fail(String(localized: "The headphones’ Bluetooth control connection changed. Reconnect to continue."))
     }
 
-    func peripheral(_ target: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+    func handlePeripheral(_ target: any SonyBLEPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard target === peripheral, service.uuid == Self.serviceUUID else { return }
         if let error { fail(error); return }
         let characteristics = service.characteristics ?? []
@@ -274,10 +359,11 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         writeCharacteristic = writer
         notifyCharacteristic = notifier
         lengthCharacteristic = length
+        recordStage("reading C91 write length")
         target.readValue(for: length)
     }
 
-    func peripheral(_ target: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+    func handlePeripheral(_ target: any SonyBLEPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard target === peripheral, characteristic === lengthCharacteristic || characteristic === notifyCharacteristic else { return }
         if let error { fail(error); return }
         guard let data = characteristic.value else {
@@ -291,13 +377,14 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
                 return
             }
             maximumLength = length
+            recordStage("subscribing to C61 notifications")
             target.setNotifyValue(true, for: notifier)
         } else if isReady {
             onData?(data)
         }
     }
 
-    func peripheral(_ target: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+    func handlePeripheral(_ target: any SonyBLEPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard target === peripheral, characteristic === notifyCharacteristic else { return }
         if let error { fail(error); return }
         guard characteristic.isNotifying, maximumLength != nil else {
@@ -308,10 +395,12 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         setupTimeout?.cancel()
         setupTimeout = nil
         isReady = true
+        isTryingSavedIdentifier = false
+        recordStage("ready")
         onReady?(target.identifier, deviceName)
     }
 
-    func peripheralIsReady(toSendWriteWithoutResponse target: CBPeripheral) {
+    func handleReadyToSend(_ target: any SonyBLEPeripheral) {
         guard target === peripheral else { return }
         drain()
     }
@@ -348,18 +437,88 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         }
     }
 
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        handleCentralState(central)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover target: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        handleCentral(central, didDiscover: target, advertisementData: advertisementData, rssi: RSSI)
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect target: CBPeripheral) {
+        handleCentral(central, didConnect: target)
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect target: CBPeripheral, error: Error?) {
+        handleCentral(central, didFailToConnect: target, error: error)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral target: CBPeripheral, error: Error?) {
+        handleCentral(central, didDisconnectPeripheral: target, error: error)
+    }
+
+    func peripheral(_ target: CBPeripheral, didDiscoverServices error: Error?) {
+        handlePeripheral(target, didDiscoverServices: error)
+    }
+
+    func peripheral(_ target: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        handlePeripheral(target, didModifyServices: invalidatedServices)
+    }
+
+    func peripheral(_ target: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        handlePeripheral(target, didDiscoverCharacteristicsFor: service, error: error)
+    }
+
+    func peripheral(_ target: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        handlePeripheral(target, didUpdateValueFor: characteristic, error: error)
+    }
+
+    func peripheral(_ target: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        handlePeripheral(target, didUpdateNotificationStateFor: characteristic, error: error)
+    }
+
+    func peripheralIsReady(toSendWriteWithoutResponse target: CBPeripheral) {
+        handleReadyToSend(target)
+    }
+
+    private func retryVerifiedIdentity() -> Bool {
+        guard isTryingSavedIdentifier, !hasRetriedVerifiedIdentity, !isReady,
+              case .verified = connectionTarget, manager?.state == .poweredOn else { return false }
+        let target = connectionTarget!
+        let model = expectedModel
+        onDiagnostic?("LE recovery: retrying verified hash after saved peripheral failure")
+        stop()
+        connectionTarget = target
+        expectedModel = model
+        hasRetriedVerifiedIdentity = true
+        sessionID = UUID()
+        recordStage("starting recovery scan")
+        manager = makeCentral(self)
+        scheduleSetupTimeout()
+        return true
+    }
+
     private nonisolated static func diagnosticDescription(_ error: Error) -> String {
         let error = error as NSError
         return "\(error.domain) (code \(error.code))"
     }
 
+    private func recordStage(_ stage: String) {
+        connectionStage = stage
+        onDiagnostic?("LE setup: \(stage)")
+    }
+
     private func fail(_ error: Error) {
+        onDiagnostic?("LE \(connectionStage) failed: \(Self.diagnosticDescription(error))")
+        if retryVerifiedIdentity() { return }
         diagnosticError = Self.diagnosticDescription(error)
         stop()
         onDisconnect?(String(localized: "Could not connect to the headphone controls. Try again."))
     }
 
     private func fail(_ message: String) {
+        onDiagnostic?("LE \(connectionStage) failed: \(message)")
+        if retryVerifiedIdentity() { return }
         diagnosticError = message
         stop()
         onDisconnect?(message)

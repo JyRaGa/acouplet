@@ -2,6 +2,305 @@ import XCTest
 @testable import Acouplet
 
 final class SonyPowerFeaturesTests: XCTestCase {
+    func testStaminaUsesAdvertisedTableAndExactKnownReplies() {
+        var features = SonyPowerFeatures(supportedFunctions2: [0x2E])
+        XCTAssertNil(features.stamina)
+        features.updateSupportedFunctions([0x2E], supportedFunctions2: [])
+        XCTAssertEqual(features.queryPayloads(frameType: 0x0C), [[0x22, 0x0E], [0x26, 0x0E]])
+        XCTAssertNil(features.stamina?.setPayload(enabled: true))
+        XCTAssertTrue(features.update([0x23, 0x0E, 0], frameType: 0x0C))
+        XCTAssertNil(features.stamina?.setPayload(enabled: true))
+        XCTAssertTrue(features.update([0x27, 0x0E, 1], frameType: 0x0C))
+        XCTAssertEqual(features.stamina?.setPayload(enabled: true), [0x28, 0x0E, 0])
+        let known = features
+        for payload: [UInt8] in [[0x27, 0x0E], [0x27, 0x0E, 0, 0], [0x27, 0x0F, 0]] {
+            XCTAssertFalse(features.update(payload, frameType: 0x0C))
+            XCTAssertEqual(features, known)
+        }
+        XCTAssertFalse(features.update([0x29, 0x0E, 0], frameType: 0x0E))
+        XCTAssertEqual(features, known)
+        XCTAssertTrue(features.update([0x25, 0x0E, 0xFF], frameType: 0x0C))
+        XCTAssertNil(features.stamina?.setPayload(enabled: true))
+        features.updateSupportedFunctions([], supportedFunctions2: [])
+        XCTAssertNil(features.stamina)
+    }
+
+    func testStaminaWarningReplyRequiresOneMatchingRequestAndSession() throws {
+        let requestID = UUID()
+        for enabled in [false, true] {
+            for message: UInt8 in enabled ? [0x84, 0x85] : [0x82, 0x83] {
+                for action: UInt8 in [1, 2] {
+                    var change = SonyStaminaChange(requestID: requestID, session: 7, enabled: enabled)
+                    let alert = try XCTUnwrap(SonyConnectionAlert(payload: [0x99, 0, message, action]))
+                    XCTAssertNil(change.receiveAlert(alert, requestID: UUID(), session: 7))
+                    XCTAssertNil(change.receiveAlert(alert, requestID: requestID, session: 8))
+                    XCTAssertEqual(change.receiveAlert(alert, requestID: requestID, session: 7), [0x98, 0, message, 1])
+                    XCTAssertNil(change.receiveAlert(alert, requestID: requestID, session: 7))
+                }
+            }
+        }
+        for payload: [UInt8] in [[0x99, 0, 0x82, 1], [0x99, 0, 0x83, 1], [0x99, 0, 0x84, 0],
+                                 [0x99, 0, 0x84, 3], [0x99, 0, 0x86, 1], [0x99, 6, 0x84, 0, 1]] {
+            var change = SonyStaminaChange(requestID: requestID, session: 7, enabled: true)
+            XCTAssertNil(change.receiveAlert(try XCTUnwrap(SonyConnectionAlert(payload: payload)), requestID: requestID, session: 7))
+        }
+    }
+
+    @MainActor
+    func testStaminaRepliesOnlyToOwnedWarningAndWaitsForDeviceState() {
+        for enabled in [false, true] {
+            let controller = makeController(modernCare: false, stamina: true)
+            defer { controller.simulateControlLoss() }
+            XCTAssertFalse(controller.canSetStamina)
+            deliver([0x23, 0x0E, 0], to: controller)
+            deliver([0x27, 0x0E, enabled ? 1 : 0], to: controller)
+            XCTAssertTrue(controller.canSetStamina)
+            let message: UInt8 = enabled ? 0x84 : 0x82
+            deliver([0x99, 0, message, 1], to: controller)
+            XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 })
+            controller.setStamina(enabled, session: controller.preferencePaneSession + 1)
+            XCTAssertNil(controller.pendingChanges[.stamina])
+            controller.setStamina(enabled, session: controller.preferencePaneSession)
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x28, 0x0E, enabled ? 0 : 1])
+            acknowledgeAll(controller)
+            deliver([0x99, 0, enabled ? 0x82 : 0x84, 1], to: controller)
+            deliver([0x99, 0, message, 3], to: controller)
+            deliver([0x99, 0, message, 1], type: 0x0E, to: controller)
+            XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 })
+            deliver([0x99, 0, message, 1], to: controller)
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x98, 0, message, 1])
+            acknowledgeAll(controller)
+            deliver([0x99, 0, message, 1], to: controller)
+            XCTAssertEqual(controller.simulatedTransmittedFrames.filter { $0.payload.first == 0x98 }.count, 1)
+            XCTAssertNotNil(controller.pendingChanges[.stamina])
+            XCTAssertEqual(controller.powerFeatures.stamina?.enabled, !enabled)
+            deliver([0x29, 0x0E, enabled ? 0 : 1], to: controller)
+            XCTAssertNil(controller.pendingChanges[.stamina])
+            XCTAssertEqual(controller.powerFeatures.stamina?.enabled, enabled)
+        }
+    }
+
+    @MainActor
+    func testStaminaWarningStartingBeforeSetterCannotAuthorizeItsReply() {
+        for enabled in [false, true] {
+            let message: UInt8 = enabled ? 0x84 : 0x82
+            let warning: [UInt8] = [0x99, 0, message, 1]
+            let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: warning)
+            for split in 1..<encoded.count {
+                let controller = makeController(modernCare: false, stamina: true)
+                defer { controller.simulateControlLoss() }
+                deliver([0x23, 0x0E, 0], to: controller)
+                deliver([0x27, 0x0E, enabled ? 1 : 0], to: controller)
+                controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x25, 0x0E, 0]))
+                controller.simulateProtocolData(encoded.prefix(split))
+                controller.setStamina(enabled, session: controller.preferencePaneSession)
+                XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x28, 0x0E, enabled ? 0 : 1])
+                controller.simulateProtocolData(encoded.dropFirst(split))
+                acknowledgeAll(controller)
+                XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 })
+                XCTAssertNotNil(controller.pendingChanges[.stamina])
+                deliver(warning, to: controller)
+                XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x98, 0, message, 1])
+                acknowledgeAll(controller)
+                deliver([0x29, 0x0E, enabled ? 0 : 1], to: controller)
+                XCTAssertNil(controller.pendingChanges[.stamina])
+            }
+        }
+    }
+
+    @MainActor
+    func testStaminaNotificationStartingBeforeWarningReplyCannotConfirmIt() {
+        for enabled in [false, true] {
+            let message: UInt8 = enabled ? 0x84 : 0x82
+            let notification: [UInt8] = [0x29, 0x0E, enabled ? 0 : 1]
+            let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: notification)
+            for split in 1..<encoded.count {
+                let controller = makeController(modernCare: false, stamina: true)
+                defer { controller.simulateControlLoss() }
+                deliver([0x23, 0x0E, 0], to: controller)
+                deliver([0x27, 0x0E, enabled ? 1 : 0], to: controller)
+                controller.setStamina(enabled, session: controller.preferencePaneSession)
+                acknowledgeAll(controller)
+                controller.defersSimulatedWrites = true
+                deliver([0x99, 0, message, 1], to: controller)
+                controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x25, 0x0E, 0]))
+                controller.simulateProtocolData(encoded.prefix(split))
+                controller.defersSimulatedWrites = false
+                for _ in 0..<3 { controller.completeSimulatedWrite() }
+                XCTAssertTrue(controller.simulatedTransmittedFrames.contains { $0.payload == [0x98, 0, message, 1] })
+                controller.simulateProtocolData(encoded.dropFirst(split))
+                acknowledgeAll(controller)
+                XCTAssertNotNil(controller.pendingChanges[.stamina])
+                deliver(notification, to: controller)
+                XCTAssertNil(controller.pendingChanges[.stamina])
+            }
+        }
+    }
+
+    @MainActor
+    func testStaminaQueuedChangeDoesNotAcceptWarningsAndRevalidatesAvailability() {
+        let controller = makeController(modernCare: false, stamina: true)
+        defer { controller.simulateControlLoss() }
+        deliver([0x23, 0x0E, 0], to: controller)
+        deliver([0x27, 0x0E, 1], to: controller)
+        deliver([0x23, 0x0C, 0], to: controller)
+        deliver([0x27, 0x0C, 1], to: controller)
+        controller.setBatteryCare(true)
+        controller.setStamina(true, session: controller.preferencePaneSession)
+        deliver([0x99, 0, 0x84, 1], to: controller)
+        deliver([0x25, 0x0E, 1], to: controller)
+        acknowledgeAll(controller)
+        XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 || $0.payload == [0x28, 0x0E, 0] })
+        XCTAssertNil(controller.pendingChanges[.stamina])
+        XCTAssertNotNil(controller.settingErrors[.stamina])
+    }
+
+    @MainActor
+    func testStaminaQueuedWarningReplyIsDiscardedWhenAvailabilityChanges() {
+        let controller = makeController(modernCare: false, stamina: true)
+        defer { controller.simulateControlLoss() }
+        deliver([0x23, 0x0E, 0], to: controller)
+        deliver([0x27, 0x0E, 1], to: controller)
+        controller.setStamina(true, session: controller.preferencePaneSession)
+        deliver([0x99, 0, 0x84, 1], to: controller)
+        deliver([0x25, 0x0E, 1], to: controller)
+        acknowledgeAll(controller)
+        XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 })
+        XCTAssertNil(controller.pendingChanges[.stamina])
+        XCTAssertNotNil(controller.settingErrors[.stamina])
+        XCTAssertFalse(controller.canSetStamina)
+        deliver([0x27, 0x0E, 1], to: controller)
+        XCTAssertNil(controller.settingErrors[.stamina])
+        XCTAssertEqual(controller.powerFeatures.stamina?.enabled, false)
+    }
+
+    @MainActor
+    func testStaminaTimeoutAndDisconnectDoNotAcceptLateWarnings() async {
+        let controller = makeController(modernCare: false, stamina: true)
+        deliver([0x23, 0x0E, 0], to: controller)
+        deliver([0x27, 0x0E, 1], to: controller)
+        controller.setStamina(true, session: controller.preferencePaneSession)
+        acknowledgeAll(controller)
+        controller.simulateSettingTimeout(.stamina)
+        for _ in 0..<4 { await Task.yield() }
+        deliver([0x99, 0, 0x84, 1], to: controller)
+        XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 })
+        XCTAssertNotNil(controller.settingErrors[.stamina])
+        XCTAssertFalse(controller.canSetStamina)
+        controller.simulateControlLoss()
+        XCTAssertNil(controller.powerFeatures.stamina)
+        deliver([0x99, 0, 0x84, 1], to: controller)
+        XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload.first == 0x98 })
+    }
+
+    func testBacklightUsesAdvertisedTableAndExactKnownReplies() {
+        var features = SonyPowerFeatures(supportedFunctions2: [0x2F])
+        XCTAssertNil(features.touchPanelBacklight)
+        XCTAssertFalse(features.update([0x29, 0x0F, 0], frameType: 0x0C))
+        features.updateSupportedFunctions([0x2F], supportedFunctions2: [])
+        XCTAssertEqual(features.queryPayloads(frameType: 0x0C), [[0x22, 0x0F], [0x26, 0x0F]])
+        XCTAssertEqual(features.queryPayloads(frameType: 0x0E), [])
+        XCTAssertNil(features.touchPanelBacklight?.setPayload(enabled: true))
+        XCTAssertTrue(features.update([0x23, 0x0F, 0], frameType: 0x0C))
+        XCTAssertNil(features.touchPanelBacklight?.setPayload(enabled: true))
+        XCTAssertTrue(features.update([0x27, 0x0F, 1], frameType: 0x0C))
+        XCTAssertEqual(features.touchPanelBacklight?.setPayload(enabled: true), [0x28, 0x0F, 0])
+        XCTAssertEqual(features.touchPanelBacklight?.setPayload(enabled: false), [0x28, 0x0F, 1])
+        let known = features
+        for payload: [UInt8] in [[], [0x27], [0x27, 0x0F], [0x27, 0x0F, 0, 0], [0x21, 0x0F, 0], [0x27, 0x0E, 0]] {
+            XCTAssertFalse(features.update(payload, frameType: 0x0C))
+            XCTAssertEqual(features, known)
+        }
+        XCTAssertFalse(features.update([0x29, 0x0F, 0], frameType: 0x0E))
+        XCTAssertEqual(features, known)
+        for payload: [UInt8] in [[0x25, 0x0F, 1], [0x25, 0x0F, 0xFF], [0x29, 0x0F, 0xFF]] {
+            features = known
+            XCTAssertTrue(features.update(payload, frameType: 0x0C))
+            XCTAssertNil(features.touchPanelBacklight?.setPayload(enabled: true))
+        }
+        for query: [UInt8] in [[0x22, 0x0F], [0x26, 0x0F]] {
+            features = known
+            features.invalidateRead(query, frameType: 0x0C)
+            XCTAssertNil(features.touchPanelBacklight?.setPayload(enabled: true))
+        }
+        features.updateSupportedFunctions([], supportedFunctions2: [])
+        XCTAssertNil(features.touchPanelBacklight)
+    }
+
+    @MainActor
+    func testBacklightControllerRequiresReadsAndDeviceConfirmation() {
+        let controller = makeController(modernCare: false, backlight: true)
+        defer { controller.simulateControlLoss() }
+        XCTAssertFalse(controller.canSetTouchPanelBacklight)
+        controller.setTouchPanelBacklight(true)
+        XCTAssertNil(controller.pendingChanges[.touchPanelBacklight])
+        deliver([0x23, 0x0F, 0], to: controller)
+        deliver([0x27, 0x0F, 1], to: controller)
+        XCTAssertTrue(controller.canSetTouchPanelBacklight)
+        controller.setTouchPanelBacklight(true)
+        XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x28, 0x0F, 0])
+        XCTAssertEqual(controller.simulatedPendingFrame?.type, 0x0C)
+        XCTAssertEqual(controller.powerFeatures.touchPanelBacklight?.enabled, false)
+        acknowledgeAll(controller)
+        XCTAssertNotNil(controller.pendingChanges[.touchPanelBacklight])
+        for payload: [UInt8] in [[0x29, 0x0F, 0, 0], [0x29, 0x0F, 0xFF]] {
+            deliver(payload, to: controller)
+            XCTAssertNotNil(controller.pendingChanges[.touchPanelBacklight])
+        }
+        deliver([0x29, 0x0F, 0], type: 0x0E, to: controller)
+        XCTAssertNotNil(controller.pendingChanges[.touchPanelBacklight])
+        deliver([0x29, 0x0F, 0], to: controller)
+        XCTAssertNil(controller.pendingChanges[.touchPanelBacklight])
+        XCTAssertEqual(controller.powerFeatures.touchPanelBacklight?.enabled, true)
+        controller.simulateControlLoss()
+        XCTAssertNil(controller.powerFeatures.touchPanelBacklight)
+    }
+
+    @MainActor
+    func testBacklightTimeoutRecoversOnlyAfterOwnedReadback() async {
+        let controller = makeController(modernCare: false, backlight: true)
+        defer { controller.simulateControlLoss() }
+        deliver([0x23, 0x0F, 0], to: controller)
+        deliver([0x27, 0x0F, 1], to: controller)
+        controller.refresh()
+        acknowledgeAll(controller)
+        controller.setTouchPanelBacklight(true)
+        acknowledgeAll(controller)
+        controller.simulateSettingTimeout(.touchPanelBacklight)
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertNil(controller.pendingChanges[.touchPanelBacklight])
+        XCTAssertNotNil(controller.settingErrors[.touchPanelBacklight])
+        XCTAssertFalse(controller.canSetTouchPanelBacklight)
+        deliver([0x27, 0x0F, 0], to: controller)
+        XCTAssertEqual(controller.powerFeatures.touchPanelBacklight?.enabled, false)
+        XCTAssertNotNil(controller.settingErrors[.touchPanelBacklight])
+        acknowledgeAll(controller)
+        deliver([0x27, 0x0F, 0], to: controller)
+        XCTAssertEqual(controller.powerFeatures.touchPanelBacklight?.enabled, true)
+        XCTAssertNil(controller.settingErrors[.touchPanelBacklight])
+        XCTAssertTrue(controller.canSetTouchPanelBacklight)
+        XCTAssertEqual(controller.simulatedTransmittedFrames.filter { $0.payload == [0x28, 0x0F, 0] }.count, 1)
+    }
+
+    @MainActor
+    func testBacklightQueuedWriteIsRejectedWhenAvailabilityChanges() {
+        let controller = makeController(modernCare: false, backlight: true)
+        defer { controller.simulateControlLoss() }
+        deliver([0x23, 0x0F, 0], to: controller)
+        deliver([0x27, 0x0F, 1], to: controller)
+        deliver([0x23, 0x0C, 0], to: controller)
+        deliver([0x27, 0x0C, 1], to: controller)
+        controller.setBatteryCare(true)
+        controller.setTouchPanelBacklight(true)
+        XCTAssertNotNil(controller.pendingChanges[.touchPanelBacklight])
+        deliver([0x25, 0x0F, 1], to: controller)
+        acknowledgeAll(controller)
+        XCTAssertFalse(controller.simulatedTransmittedFrames.contains { $0.payload == [0x28, 0x0F, 0] })
+        XCTAssertNil(controller.pendingChanges[.touchPanelBacklight])
+        XCTAssertNotNil(controller.settingErrors[.touchPanelBacklight])
+        XCTAssertEqual(controller.powerFeatures.touchPanelBacklight?.enabled, false)
+    }
+
     @MainActor
     func testControllerCareUsesNegotiatedTableAndReplyConfirmation() {
         for modern in [false, true] {
@@ -103,7 +402,7 @@ final class SonyPowerFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    private func makeController(modernCare: Bool, acknowledgePowerReads: Bool = true) -> SonyHeadphonesController {
+    private func makeController(modernCare: Bool, acknowledgePowerReads: Bool = true, backlight: Bool = false, stamina: Bool = false) -> SonyHeadphonesController {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         controller.simulateDeviceConnection(named: "WF-1000XM5")
         controller.simulateProtocolMessage([0x01, 0, 0x03, 0, 0x30, 0x18, 0, 0], beginConnection: true)
@@ -111,7 +410,7 @@ final class SonyPowerFeaturesTests: XCTestCase {
         let name = Array("WF-1000XM5".utf8)
         deliver([0x05, 1, UInt8(name.count)] + name, to: controller)
         deliver([0x05, 3, 0, 0], to: controller)
-        let functions: [UInt8] = modernCare ? [0x6B, 0x2B] : [0x6B, 0x2B, 0x2C]
+        let functions: [UInt8] = (modernCare ? [0x6B, 0x2B] : [0x6B, 0x2B, 0x2C]) + (backlight ? [0x2F] : []) + (stamina ? [0x2E, 0x90] : [])
         deliver([0x07, 0, UInt8(functions.count)] + functions.flatMap { [$0, 0] }, to: controller)
         acknowledgeAll(controller)
         deliver([0x67, 0x17, 1, 1, 0, 0, 10], to: controller)

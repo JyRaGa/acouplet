@@ -1428,6 +1428,27 @@ final class SonySystemFeatureOwnershipTests: XCTestCase {
         }
     }
 
+    func testFeatureNotificationStartingBeforeSetterCannotConfirmAfterTransmission() {
+        for (feature, enabled): (SonySystemFeature, Bool) in [(.pauseOnRemoval, false), (.headGestures, true), (.speakToChat, true)] {
+            let notification = parameter(0xF9, feature, enabled: enabled)
+            let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: notification)
+            for split in 1..<encoded.count {
+                let controller = readyController()
+                defer { controller.simulateControlLoss() }
+                XCTAssertEqual(controller.systemFeatures[feature]?.enabled, !enabled)
+                controller.simulateProtocolData(encoded.prefix(split))
+                controller.setSystemFeature(feature, enabled: enabled)
+                XCTAssertNotNil(controller.pendingChanges[.system(feature)])
+                XCTAssertTrue(payloads(controller).contains(parameter(0xF8, feature, enabled: enabled)))
+                controller.simulateProtocolData(encoded.dropFirst(split))
+                XCTAssertNotNil(controller.pendingChanges[.system(feature)])
+                acknowledgeSimulatedCommands(controller)
+                deliver(notification, to: controller)
+                XCTAssertNil(controller.pendingChanges[.system(feature)])
+            }
+        }
+    }
+
     func testPrewritePollCannotConfirmAFeatureUntilFreshOwnedReadback() {
         for feature in [SonySystemFeature.pauseOnRemoval, .headGestures, .speakToChat] {
             let controller = readyController()

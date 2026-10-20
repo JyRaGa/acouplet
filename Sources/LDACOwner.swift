@@ -29,17 +29,32 @@ private struct LDACOwnerRequest: Codable, Sendable {
 }
 
 private enum LDACOwnerMessage: Codable, Sendable {
-    case reply(UUID, LDACNativeVolume?, String?)
+    case reply(UUID, LDACNativeVolume?, LDACOwnerError?)
     case controls(LDACNativeVolume)
-    case outputFailure(String, Bool)
+    case outputFailure(LDACOwnerError, Bool)
     case session(UUID, LDACNativeSession.Event)
     case exited
     case recovery(LDACRouteRecovery)
 }
 
-private struct LDACOwnerError: LocalizedError {
+struct LDACOwnerError: LocalizedError, Codable, Sendable {
     let message: String
+    let diagnostic: LDACNativeSession.Diagnostic?
+    let ownerID: UUID?
     var errorDescription: String? { message }
+
+    init(message: String, diagnostic: LDACNativeSession.Diagnostic? = nil, ownerID: UUID? = nil) {
+        self.message = message
+        self.diagnostic = diagnostic
+        self.ownerID = ownerID
+    }
+
+    @MainActor
+    init(_ error: Error, ownerID: UUID? = nil) {
+        self.init(message: error.localizedDescription,
+                  diagnostic: .init(stage: "native output", detail: LDACNativeOutput.diagnosticDescription(error), isFailure: !(error is CancellationError)),
+                  ownerID: ownerID)
+    }
 }
 
 private final class LDACOwnerChannel: @unchecked Sendable {
@@ -97,7 +112,7 @@ private final class LDACOwnerChannel: @unchecked Sendable {
             shutdown()
             throw LDACOwnerError(message: String(localized: "LDAC did not stop completely."))
         }
-        if let error { throw LDACOwnerError(message: error) }
+        if let error { throw error }
         return controls
     }
 
@@ -265,14 +280,27 @@ final class LDACOwnerOutput {
 
     deinit { channel?.close() }
 
+    #if DEBUG
+    func simulateOutputFailure(_ error: Error, ownerID: UUID) throws {
+        let data = try JSONEncoder().encode(LDACOwnerMessage.outputFailure(LDACOwnerError(error, ownerID: ownerID), false))
+        receive(try JSONDecoder().decode(LDACOwnerMessage.self, from: data))
+    }
+
+    func simulateSessionEvent(_ event: LDACNativeSession.Event, id: UUID) throws {
+        let data = try JSONEncoder().encode(LDACOwnerMessage.session(id, event))
+        receive(try JSONDecoder().decode(LDACOwnerMessage.self, from: data))
+    }
+    #endif
+
     private func receive(_ message: LDACOwnerMessage) {
         switch message {
         case let .controls(controls):
             self.controls = channel?.currentControls ?? controls
             changed(.success(self.controls))
-        case let .outputFailure(message, priority):
-            if priority { changed(.failure(LDACPriorityCleanupError(message: message))) }
-            else { changed(.failure(LDACOwnerError(message: message))) }
+        case let .outputFailure(error, priority):
+            guard error.ownerID == nil || error.ownerID == id else { return }
+            if priority { changed(.failure(LDACPriorityCleanupError(message: error.message, diagnostic: error.diagnostic))) }
+            else { changed(.failure(error)) }
         case let .session(id, event):
             if sessionReceiver?.0 == id { sessionReceiver?.1(event) }
         case .exited:
@@ -344,6 +372,7 @@ enum LDACOwnerWorker {
         private var parentWatcher: DispatchSourceProcess?
         private var signalWatchers: [DispatchSourceSignal] = []
         private var output: LDACNativeOutput?
+        private var outputID: UUID?
         private var priority: LDACPriorityControl?
         private var session: LDACNativeSession?
         private var claimTask: Task<Void, Never>?
@@ -410,10 +439,16 @@ enum LDACOwnerWorker {
             } catch { scheduleParentExit() }
         }
 
-        private func reply(_ request: LDACOwnerRequest, error: String? = nil) {
+        private func reply(_ request: LDACOwnerRequest, error: String? = nil, diagnostic: LDACNativeSession.Diagnostic? = nil) {
             if let output { send(.recovery(output.routeRecovery)) }
-            if let id = request.id { send(.reply(id, output?.controls, error)) }
-            else if let error { send(.outputFailure(error, false)) }
+            let failure = error.map { LDACOwnerError(message: $0, diagnostic: diagnostic, ownerID: outputID) }
+            if let id = request.id { send(.reply(id, output?.controls, failure)) }
+            else if let failure { send(.outputFailure(failure, false)) }
+        }
+
+        private func reply(_ request: LDACOwnerRequest, failure: Error) {
+            let error = LDACOwnerError(failure)
+            reply(request, error: error.message, diagnostic: error.diagnostic)
         }
 
         private func handle(_ request: LDACOwnerRequest) {
@@ -423,12 +458,13 @@ enum LDACOwnerWorker {
                 case let .claim(id, address, model, sampleRate):
                     if startCancelled { throw CancellationError() }
                     guard output == nil else { throw LDACOwnerError(message: String(localized: "LDAC playback stopped unexpectedly. Try again.")) }
+                    outputID = id
                     let output = LDACNativeOutput(id: id, address: address) { [weak self] result in
                         switch result {
                         case let .success(controls):
                             if let output = self?.output { self?.send(.recovery(output.routeRecovery)) }
                             self?.send(.controls(controls))
-                        case let .failure(error): self?.send(.outputFailure(error.localizedDescription, error is LDACPriorityCleanupError))
+                        case let .failure(error): self?.send(.outputFailure(LDACOwnerError(error, ownerID: id), error is LDACPriorityCleanupError))
                         }
                     }
                     self.output = output
@@ -438,7 +474,7 @@ enum LDACOwnerWorker {
                             try await output.claim(model: model, targetAddress: address, sampleRate: sampleRate)
                             try Task.checkCancellation()
                             reply(request)
-                        } catch { reply(request, error: error.localizedDescription) }
+                        } catch { reply(request, failure: error) }
                         claimTask = nil
                         if parentEnded { await restoreAfterParentExit() }
                     }
@@ -484,12 +520,16 @@ enum LDACOwnerWorker {
                     self.output = output
                     claimTask = Task {
                         var failure: String?
+                        var diagnostic: LDACNativeSession.Diagnostic?
                         do {
                             try await output.claim(model: recovery.model, targetAddress: recovery.address,
                                 sampleRate: recovery.sampleRate, recovering: recovery)
-                        } catch { failure = error.localizedDescription }
+                        } catch {
+                            failure = error.localizedDescription
+                            diagnostic = LDACOwnerError(error).diagnostic
+                        }
                         let restoreError = await output.restoreAndRelease()
-                        reply(request, error: failure ?? restoreError)
+                        reply(request, error: failure ?? restoreError, diagnostic: diagnostic)
                         exit(failure == nil && restoreError == nil ? EXIT_SUCCESS : EXIT_FAILURE)
                     }
                     return
@@ -504,7 +544,7 @@ enum LDACOwnerWorker {
                 if case let .start(id, _, _, _) = request.command {
                     send(.session(id, .finished(.init(message: String(localized: "LDAC did not stop completely."),
                         canRetry: false, requiresAttention: true, targetDisconnected: false, waitForReconnect: false))))
-                } else { reply(request, error: error.localizedDescription) }
+                } else { reply(request, failure: error) }
             }
         }
 

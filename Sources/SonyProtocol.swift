@@ -221,6 +221,18 @@ struct SonyFrame: Equatable, Sendable {
     let type: UInt8
     let sequence: UInt8
     let payload: [UInt8]
+
+    var requiresAcknowledgment: Bool {
+        ![0x01, 0x10, 0x12, 0x19, 0x1A, 0x1C, 0x1D, 0x1E].contains(type)
+    }
+
+    var mdrType: UInt8? {
+        switch type {
+        case 0x0C, 0x1C, 0x2C: 0x0C
+        case 0x0E, 0x1E: 0x0E
+        default: nil
+        }
+    }
 }
 
 enum SonyFrameCodec {
@@ -277,22 +289,25 @@ struct SonyFrameStream: Sendable {
     static let maximumFrameLength = 65_536
     private var buffer = Data()
     private var transmissionID: UUID?
+    private var transmissionOrdinal: UInt64 = 0
 
     mutating func append(_ data: Data) -> [SonyFrame] {
         append(data, transmissionID: nil).map(\.frame)
     }
 
-    mutating func append(_ data: Data, transmissionID: UUID?) -> [(frame: SonyFrame, transmissionID: UUID?)] {
-        var frames: [(frame: SonyFrame, transmissionID: UUID?)] = []
+    mutating func append(_ data: Data, transmissionID: UUID?, transmissionOrdinal: UInt64 = 0)
+        -> [(frame: SonyFrame, transmissionID: UUID?, transmissionOrdinal: UInt64)] {
+        var frames: [(frame: SonyFrame, transmissionID: UUID?, transmissionOrdinal: UInt64)] = []
         for byte in data {
             if byte == SonyFrameCodec.header {
                 buffer.removeAll(keepingCapacity: true)
                 self.transmissionID = transmissionID
+                self.transmissionOrdinal = transmissionOrdinal
             }
             guard byte == SonyFrameCodec.header || !buffer.isEmpty else { continue }
             buffer.append(byte)
             if byte == SonyFrameCodec.trailer {
-                if let frame = SonyFrameCodec.decode(buffer) { frames.append((frame, self.transmissionID)) }
+                if let frame = SonyFrameCodec.decode(buffer) { frames.append((frame, self.transmissionID, self.transmissionOrdinal)) }
                 buffer.removeAll(keepingCapacity: true)
             } else if buffer.count == Self.maximumFrameLength {
                 buffer.removeAll(keepingCapacity: true)

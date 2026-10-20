@@ -1,8 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <IOBluetooth/IOBluetooth.h>
-#include "../SonyClassicConnection.h"
 #include "LDACParentLifetime.h"
+#include <inttypes.h>
+#import <objc/runtime.h>
 #include <poll.h>
 #include <errno.h>
 #include <limits.h>
@@ -17,14 +18,24 @@
 #endif
 
 @interface CBClassicPeer : CBPeer
+@property(readonly) NSInteger internalState;
+@property(readonly) id manager;
+- (id)sendInternalSyncMsg:(int)message args:(NSDictionary *)arguments;
+- (void)handleGetPeerState:(NSDictionary *)reply;
 @property(copy) void (^connectL2CAPCallback)(CBL2CAPChannel *, NSInteger);
 @property(copy) void (^disconnectL2CAPCallback)(CBL2CAPChannel *, NSInteger);
 - (void)openL2CAPChannel:(UInt16)psm;
 - (void)closeL2CAPChannel:(UInt16)psm;
 @end
 
-@interface IOBluetoothDevice (ClassicPeerAccess)
-@property(readonly) CBClassicPeer *classicPeer;
+@interface CBClassicManager : CBManager
+@property(readonly) BOOL tccApproved;
+@property(readonly) BOOL tccComplete;
+@property(readonly) BOOL tccRequired;
+- (instancetype)initWithQueue:(dispatch_queue_t)queue options:(NSDictionary *)options;
+- (CBClassicPeer *)peerWithIdentifier:(NSUUID *)identifier;
+- (void)checkForTCC;
+- (CBClassicPeer *)retrievePeerWithAddress:(NSString *)address;
 @end
 
 @interface CBL2CAPChannel (ChannelInspection)
@@ -32,6 +43,9 @@
 @property(readonly) UInt16 outgoingMTU;
 @property(readonly) int socketFD;
 @end
+
+static volatile sig_atomic_t interrupted;
+static void Stop(int number) { interrupted = number; }
 
 static void RunLoopFor(NSTimeInterval seconds) {
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false);
@@ -73,13 +87,136 @@ static BOOL ParseSampleRate(const char *input, uint32_t *sampleRate) {
     return YES;
 }
 
-static void PrintChannel(const char *event, CBL2CAPChannel *channel) {
-    printf("%s time=%.6f channel=%p PSM=%04X localCID=%04X outgoingMTU=%u\n",
-           event, NSDate.date.timeIntervalSince1970, (__bridge void *)channel, channel.PSM,
-           channel.cid, channel.outgoingMTU);
+typedef struct {
+    NSUInteger responseLength;
+    NSUInteger consumed;
+    NSUInteger commands;
+    BOOL rejected;
+} Parsed;
+
+static NSUInteger FixedCommandLength(const uint8_t *bytes, NSUInteger length) {
+    if (length < 2 || (bytes[0] & 15) || (bytes[1] & 0xC0)) return 0;
+    switch (bytes[1]) {
+        case 1: return 2;
+        case 2: case 4: case 6: case 8: case 10: case 12: return 3;
+        case 13: return 5;
+        default: return 0;
+    }
 }
 
+static NSUInteger FixedResponseLength(const uint8_t *bytes, NSUInteger length, uint8_t transaction, uint8_t signal) {
+    if (length < 2 || bytes[1] != signal || (bytes[0] >> 4) != transaction || (bytes[0] & 12)) return 0;
+    if ((bytes[0] & 3) == 2) return signal == 3 || (signal >= 6 && signal <= 10) ? 2 : 0;
+    if ((bytes[0] & 3) != 3) return 0;
+    switch (signal) {
+        case 1: case 2: case 4: case 6: case 8: case 12: return 3;
+        case 3: case 7: case 9: return 4;
+        default: return 0;
+    }
+}
+
+static BOOL FragmentedCommandPossible(const uint8_t *bytes, NSUInteger length) {
+    uint8_t command[] = {(uint8_t)(bytes[0] & 0xF0), bytes[2]};
+    if (bytes[1] != 2 || FixedCommandLength(command, sizeof(command)) != 3) return YES;
+    uint8_t endHeader = (bytes[0] & 0xF0) | 12;
+    for (NSUInteger startLength = 3; startLength <= 4; startLength++) {
+        if (length <= startLength || bytes[startLength] == endHeader || (bytes[startLength] & 15) == 4) return YES;
+        if (!(bytes[startLength] & 15) &&
+            (length == startLength + 1 || bytes[startLength + 1] == 10)) return YES;
+    }
+    return NO;
+}
+
+static void Candidate(const uint8_t *bytes, NSUInteger length, NSUInteger end,
+                      BOOL rejected, Parsed *parsed, NSUInteger *solutions, BOOL *unsupported) {
+    NSUInteger offset = end, commands = 0;
+    while (offset < length) {
+        if (length - offset >= 2 && bytes[offset] == 0xF1 && bytes[offset + 1] == 0x3F) {
+            *parsed = (Parsed){end, offset + 2, commands, rejected};
+            (*solutions)++;
+            return;
+        }
+        NSUInteger remaining = length - offset;
+        if (remaining >= 2 && !(bytes[offset] & 3)) {
+            uint8_t type = bytes[offset] & 12;
+            uint8_t signal = bytes[offset + 1];
+            if ((!type && (signal == 3 || signal == 5 || signal == 7 || signal == 9 || signal == 11)) ||
+                (type == 4 && remaining >= 3 && bytes[offset + 2] >= 1 && bytes[offset + 2] <= 13 &&
+                 FragmentedCommandPossible(bytes + offset, remaining))) {
+                *unsupported = YES;
+                return;
+            }
+        }
+        NSUInteger size = FixedCommandLength(bytes + offset, length - offset);
+        if (!size || length - offset < size) return;
+        offset += size;
+        commands++;
+    }
+}
+
+static int Parse(const uint8_t *bytes, NSUInteger length, uint8_t transaction, uint8_t signal, Parsed *parsed) {
+    *parsed = (Parsed){0};
+    if (length < 2) return 0;
+    if (bytes[1] != signal || (bytes[0] >> 4) != transaction || (bytes[0] & 12)) return -1;
+    BOOL rejected = (bytes[0] & 3) == 3;
+    if (!rejected && (bytes[0] & 3) != 2) return -1;
+    NSUInteger solutions = 0;
+    BOOL unsupported = NO;
+    if (rejected) {
+        NSUInteger size;
+        switch (signal) {
+            case 1: case 2: case 4: case 6: case 8: case 12: size = 3; break;
+            case 3: case 7: case 9: size = 4; break;
+            default: return -1;
+        }
+        if (length >= size) Candidate(bytes, length, size, YES, parsed, &solutions, &unsupported);
+    } else if (signal == 3 || (signal >= 6 && signal <= 10)) {
+        Candidate(bytes, length, 2, NO, parsed, &solutions, &unsupported);
+    } else if (signal == 1) {
+        uint64_t seen = 0;
+        for (NSUInteger offset = 2; offset + 2 <= length; offset += 2) {
+            uint8_t seid = bytes[offset] >> 2, info = bytes[offset + 1];
+            if ((bytes[offset] & 1) || seid < 1 || seid > 62 || (seen & (1ULL << seid)) ||
+                (info & 7) || (info >> 4) > 2) break;
+            seen |= 1ULL << seid;
+            Candidate(bytes, length, offset + 2, NO, parsed, &solutions, &unsupported);
+        }
+    } else if (signal == 2 || signal == 4 || signal == 12) {
+        unsigned seen = 0;
+        NSUInteger offset = 2;
+        NSUInteger alternateSolutions = 0;
+        Parsed alternate;
+        Candidate(bytes, length, offset, NO, &alternate, &alternateSolutions, &unsupported);
+        if (alternateSolutions) unsupported = YES;
+        while (offset + 2 <= length) {
+            uint8_t category = bytes[offset], size = bytes[offset + 1];
+            if (category < 1 || category > 8 || (seen & (1U << category))) break;
+            if ((category == 1 && size != 0) || (category == 7 && size < 2)) break;
+            seen |= 1U << category;
+            offset += 2 + size;
+            if (offset > length) break;
+            if ((seen & (1U << 1)) && (seen & (1U << 7))) Candidate(bytes, length, offset, NO, parsed, &solutions, &unsupported);
+            else {
+                alternateSolutions = 0;
+                Candidate(bytes, length, offset, NO, &alternate, &alternateSolutions, &unsupported);
+                if (alternateSolutions) unsupported = YES;
+            }
+        }
+    } else return -1;
+    if (solutions > 1) return -2;
+    if (solutions && unsupported) return -3;
+    return solutions == 1 ? 1 : 0;
+}
+
+
 @interface DirectPlaybackProbe : NSObject
+@property BOOL openRequested;
+@property BOOL openDone;
+@property BOOL openIndeterminate;
+@property NSInteger openError;
+@property BOOL framingUncertain;
+@property double hardDeadline;
+@property(copy) BOOL (^callbacksIntact)(void);
 @property BOOL closed;
 @property BOOL closing;
 @property BOOL failed;
@@ -90,9 +227,8 @@ static void PrintChannel(const char *event, CBL2CAPChannel *channel) {
 @property(strong) NSOutputStream *output;
 @property NSMutableData *pending;
 @property NSMutableData *raw;
-@property NSMutableData *controlPending;
-@property BOOL playback;
 @property BOOL continuous;
+@property NSMutableData *controlPending;
 @property BOOL stopRequested;
 @property BOOL stdinEnded;
 @property BOOL protocolCleanup;
@@ -113,6 +249,8 @@ static void PrintChannel(const char *event, CBL2CAPChannel *channel) {
 
 @implementation DirectPlaybackProbe
 - (void)pollInput {
+    if (interrupted) self.stopRequested = YES;
+    if (self.callbacksIntact && !self.callbacksIntact()) self.failed = YES;
     if (self.closed || self.failed || !self.input) return;
     while (self.input.hasBytesAvailable) {
         uint8_t bytes[4096];
@@ -127,12 +265,12 @@ static void PrintChannel(const char *event, CBL2CAPChannel *channel) {
             if (!self.closing) self.failed = YES;
             return;
         }
-        if (self.raw.length + (NSUInteger)length > 65536) {
+        if (self.pending.length + (NSUInteger)length > 4096) {
             self.failed = YES;
             return;
         }
         [self.pending appendBytes:bytes length:(NSUInteger)length];
-        [self.raw appendBytes:bytes length:(NSUInteger)length];
+        [self.raw appendBytes:bytes length:MIN((NSUInteger)length, 65536 - self.raw.length)];
         self.received += (NSUInteger)length;
     }
     if (self.input.streamStatus == NSStreamStatusAtEnd) self.inputEnded = YES;
@@ -145,7 +283,9 @@ static void PrintChannel(const char *event, CBL2CAPChannel *channel) {
 @end
 
 static NSString *ReadLine(DirectPlaybackProbe *probe, double deadline, BOOL requireLink, NSTimeInterval interval) {
+    deadline = MIN(deadline, probe.hardDeadline);
     while (!probe.stdinEnded && (!requireLink || (!probe.closed && !probe.failed)) && MonotonicTime() < deadline) {
+        if (interrupted && !probe.stopRequested) { probe.stopRequested = YES; return @"stop"; }
         struct pollfd descriptor = {STDIN_FILENO, POLLIN, 0};
         int ready = poll(&descriptor, 1, 0);
         if (ready < 0) {
@@ -179,42 +319,6 @@ static NSString *ReadLine(DirectPlaybackProbe *probe, double deadline, BOOL requ
         }
         [probe pollInput];
         RunLoopFor(interval);
-    }
-    return nil;
-}
-
-static NSData *ConsumeSDU(DirectPlaybackProbe *probe, NSString *line, double deadline) {
-    unsigned int cid = 0, length = 0;
-    char extra;
-    if (sscanf(line.UTF8String, "%x %u %c", &cid, &length, &extra) != 2 ||
-        !cid || cid > UINT16_MAX || length < 2 || length > 4096 ||
-        (probe.realCID && probe.realCID != cid)) {
-        printf("INVALID_SDU_GATE\n");
-        return nil;
-    }
-    probe.realCID = (UInt16)cid;
-    printf("SDU_GATE time=%.6f CID=%04X length=%u\n",
-           NSDate.date.timeIntervalSince1970, probe.realCID, length);
-    while (probe.pending.length < length && !probe.closed && !probe.failed && MonotonicTime() < deadline) {
-        [probe pollInput];
-        RunLoopFor(0.001);
-    }
-    if (probe.pending.length >= length && (probe.playback || probe.pending.length == length)) {
-        NSData *reply = [probe.pending subdataWithRange:NSMakeRange(0, length)];
-        [probe.pending replaceBytesInRange:NSMakeRange(0, length) withBytes:NULL length:0];
-        return reply;
-    }
-    printf("NO_FRAMED_REPLY pending=%lu closed=%d failed=%d\n",
-           probe.pending.length, probe.closed, probe.failed);
-    return nil;
-}
-
-static NSData *FramedReply(DirectPlaybackProbe *probe, double deadline) {
-    printf("WAIT_SDU gate=realCID decimalLength deadline=30s\n");
-    while (!probe.stdinEnded && MonotonicTime() < deadline) {
-        NSString *line = ReadLine(probe, deadline, YES, 0.001);
-        if ([line isEqualToString:@"stop"]) continue;
-        return line ? ConsumeSDU(probe, line, deadline) : nil;
     }
     return nil;
 }
@@ -375,52 +479,128 @@ static BOOL HandlePeerCommand(DirectPlaybackProbe *probe, NSData *packet) {
     return YES;
 }
 
-static NSData *AwaitResponse(DirectPlaybackProbe *probe, uint8_t transaction, uint8_t signal) {
-    probe.lastRejected = NO;
-    double deadline = MonotonicTime() + 30;
-    while (!probe.closed && !probe.failed && !probe.peerStopped && MonotonicTime() < deadline) {
-        NSData *packet = FramedReply(probe, deadline);
-        if (!packet) break;
-        const uint8_t *bytes = packet.bytes;
-        if ((bytes[0] & 15) == 0) {
-            if (!HandlePeerCommand(probe, packet)) break;
+static int ServicePendingSignals(DirectPlaybackProbe *probe, uint8_t transaction, uint8_t signal) {
+    while (probe.pending.length && !probe.failed && !probe.closed) {
+        if (probe.pending.length < 2) return 0;
+        const uint8_t *bytes = probe.pending.bytes;
+        if (bytes[0] & 3) {
+            if ((bytes[0] >> 4) == transaction && bytes[1] == signal && signal) return 1;
+            NSUInteger length = FixedResponseLength(bytes, probe.pending.length, bytes[0] >> 4, bytes[1]);
+            if (!length) {
+                printf("UNMATCHED_RESPONSE_FRAMING_UNSUPPORTED\n");
+                probe.framingUncertain = YES;
+                return -1;
+            }
+            if (probe.pending.length < length) return 0;
+            printf("UNMATCHED_RESPONSE_DISCARDED transaction=%u signal=%02X length=%lu\n", bytes[0] >> 4, bytes[1], length);
+            [probe.pending replaceBytesInRange:NSMakeRange(0, length) withBytes:NULL length:0];
             continue;
         }
-        if (packet.length < 2 || bytes[0] >> 4 != transaction || bytes[1] != signal || bytes[0] & 12)
-            break;
-        if ((bytes[0] & 3) == 3) {
-            NSUInteger expected = (signal == 3 || signal == 5 || signal == 7 || signal == 9) ? 4 : 3;
-            if (signal != 10 && packet.length == expected) {
-                probe.lastRejected = YES;
-                printf("RESPONSE_REJECTED transaction=%u signal=%02X error=%02X\n",
-                       transaction, signal, bytes[packet.length - 1]);
-            }
+        NSUInteger length = FixedCommandLength(bytes, probe.pending.length);
+        if (!length) {
+            printf("PEER_COMMAND_FRAMING_UNSUPPORTED\n");
+            probe.framingUncertain = YES;
+            return -1;
+        }
+        if (probe.pending.length < length) return 0;
+        NSData *packet = [probe.pending subdataWithRange:NSMakeRange(0, length)];
+        [probe.pending replaceBytesInRange:NSMakeRange(0, length) withBytes:NULL length:0];
+        if (!HandlePeerCommand(probe, packet)) {
+            probe.framingUncertain = YES;
+            return -1;
+        }
+    }
+    return 1;
+}
+
+static BOOL QueryCancelled(DirectPlaybackProbe *probe) {
+    NSString *line = ReadLine(probe, MonotonicTime() + 0.001, NO, 0.0001);
+    if (line && ![line isEqualToString:@"stop"]) {
+        printf("UNEXPECTED_CONTROL_DURING_QUERY\n");
+        probe.failed = YES;
+    }
+    return probe.stdinEnded || probe.closed || probe.failed || probe.peerStopped ||
+        (probe.stopRequested && !probe.protocolCleanup);
+}
+
+static NSData *AwaitResponse(DirectPlaybackProbe *probe, uint8_t transaction, uint8_t signal) {
+    probe.lastRejected = NO;
+    BOOL markerSent = NO;
+    double deadline = MIN(probe.hardDeadline, MonotonicTime() + 3);
+    while (MonotonicTime() < deadline && !QueryCancelled(probe)) {
+        [probe pollInput];
+        int serviced = ServicePendingSignals(probe, transaction, signal);
+        if (serviced < 0 || probe.peerStopped) break;
+        if (!serviced) continue;
+        Parsed parsed = {0};
+        NSUInteger fixed = FixedResponseLength(probe.pending.bytes, probe.pending.length, transaction, signal);
+        int result;
+        if (fixed) {
+            if (probe.pending.length < fixed) continue;
+            parsed = (Parsed){fixed, fixed, 0, ((((const uint8_t *)probe.pending.bytes)[0] & 3) == 3)};
+            result = 1;
+        } else result = Parse(probe.pending.bytes, probe.pending.length, transaction, signal, &parsed);
+        if (result < 0 || (result == 1 && !fixed && !markerSent)) {
+            printf("RESPONSE_FRAMING_REJECT result=%d marker_sent=%d\n", result, markerSent);
             break;
         }
-        if ((bytes[0] & 3) != 2) break;
+        if (!fixed && !markerSent && probe.pending.length >= 2) {
+            const uint8_t marker[] = {0xF0, 0x3F};
+            if (!SendSignal(probe, [NSData dataWithBytes:marker length:sizeof(marker)])) break;
+            markerSent = YES;
+        }
+        if (result != 1) continue;
+        NSData *reply = [probe.pending subdataWithRange:NSMakeRange(0, parsed.responseLength)];
+        NSData *commands = [probe.pending subdataWithRange:NSMakeRange(parsed.responseLength,
+            parsed.consumed - parsed.responseLength - (fixed ? 0 : 2))];
+        [probe.pending replaceBytesInRange:NSMakeRange(0, parsed.consumed) withBytes:NULL length:0];
+        probe.framingUncertain = NO;
+        const uint8_t *bytes = commands.bytes;
+        for (NSUInteger offset = 0; offset < commands.length;) {
+            NSUInteger length = FixedCommandLength(bytes + offset, commands.length - offset);
+            if (!length || length > commands.length - offset ||
+                !HandlePeerCommand(probe, [commands subdataWithRange:NSMakeRange(offset, length)])) {
+                probe.framingUncertain = YES;
+                return nil;
+            }
+            offset += length;
+        }
+        if (ServicePendingSignals(probe, 0, 0) < 0) return nil;
+        if (probe.peerStopped) return nil;
+        probe.lastRejected = parsed.rejected;
+        if (parsed.rejected) {
+            printf("RESPONSE_REJECTED transaction=%u signal=%02X error=%02X\n", transaction, signal,
+                   ((const uint8_t *)reply.bytes)[reply.length - 1]);
+            return nil;
+        }
         printf("RESPONSE_ACCEPTED transaction=%u signal=%02X length=%lu CID=%04X\n",
-               transaction, signal, packet.length, probe.realCID);
-        return packet;
+               transaction, signal, reply.length, probe.realCID);
+        return reply;
     }
-    printf("RESPONSE_FAILED transaction=%u signal=%02X rejected=%d\n", transaction, signal, probe.lastRejected);
+    printf("RESPONSE_FAILED transaction=%u signal=%02X rejected=%d framing_unconfirmed=1\n",
+           transaction, signal, probe.lastRejected);
     return nil;
 }
 
 static NSData *Query(DirectPlaybackProbe *probe, uint8_t *transaction, uint8_t signal, NSData *payload) {
     probe.lastRejected = NO;
-    if (probe.stdinEnded || (probe.stopRequested && !probe.protocolCleanup)) return nil;
-    double deadline = MonotonicTime() + 30;
-    while (probe.pending.length && !probe.closed && !probe.failed && !probe.peerStopped) {
-        NSData *packet = FramedReply(probe, deadline);
-        if (!packet || !HandlePeerCommand(probe, packet)) return nil;
+    if (*transaction >= 15 || probe.framingUncertain || QueryCancelled(probe)) return nil;
+    double deadline = MIN(probe.hardDeadline, MonotonicTime() + 3);
+    [probe pollInput];
+    while (probe.pending.length && !QueryCancelled(probe) && MonotonicTime() < deadline) {
+        if (ServicePendingSignals(probe, 0, 0) < 0) return nil;
+        if (!probe.pending.length) break;
+        RunLoopFor(0.001);
+        [probe pollInput];
     }
-    if (probe.closed || probe.failed || probe.peerStopped || (probe.stopRequested && !probe.protocolCleanup)) return nil;
+    if (probe.pending.length || QueryCancelled(probe) || MonotonicTime() >= deadline) return nil;
     uint8_t label = *transaction;
-    *transaction = (label + 1) & 15;
+    *transaction = (label + 1) % 15;
     uint8_t header[] = {(uint8_t)(label << 4), signal};
-    NSMutableData *request = [NSMutableData dataWithBytes:header length:2];
+    NSMutableData *request = [NSMutableData dataWithBytes:header length:sizeof(header)];
     [request appendData:payload];
     if (signal == 3) probe.configurationSent = YES;
+    probe.framingUncertain = YES;
     if (!SendSignal(probe, request)) return nil;
     return AwaitResponse(probe, label, signal);
 }
@@ -428,29 +608,24 @@ static NSData *Query(DirectPlaybackProbe *probe, uint8_t *transaction, uint8_t s
 static BOOL EmptyAcceptance(NSData *reply) { return reply != nil && reply.length == 2; }
 
 static BOOL WaitControl(DirectPlaybackProbe *probe, NSString *command) {
-    NSTimeInterval timeout = [command isEqualToString:@"media-finished"] ? 70 : 30;
-#if ACOUPLET_LDAC_PROBE_ONLY
-    BOOL continuous = probe.continuous && [command isEqualToString:@"media-finished"];
-#else
-    BOOL continuous = [command isEqualToString:@"media-finished"];
-#endif
-    if (continuous) printf("WAIT_CONTROL %s deadline=unbounded\n", command.UTF8String);
-    else printf("WAIT_CONTROL %s deadline=%.0fs\n", command.UTF8String, timeout);
-    double deadline = continuous ? INFINITY : MonotonicTime() + timeout;
+    BOOL closing = [command isEqualToString:@"media-closed"];
+    NSTimeInterval timeout = [command isEqualToString:@"media-finished"] ? (probe.continuous ? INFINITY : 70) : closing ? 5 : 30;
+    printf("WAIT_CONTROL %s deadline=%.0fs\n", command.UTF8String, timeout);
+    double deadline = MIN(probe.hardDeadline, MonotonicTime() + timeout);
     while (MonotonicTime() < deadline) {
-        if (probe.stdinEnded || (probe.stopRequested && ![command isEqualToString:@"media-closed"])) break;
-        NSString *line = ReadLine(probe, deadline, ![command isEqualToString:@"media-closed"], continuous ? 0.02 : 0.001);
-        if (!line) break;
-        if ([line isEqualToString:@"stop"]) {
-            if (![command isEqualToString:@"media-closed"]) break;
-            continue;
+        if (probe.stdinEnded || (probe.stopRequested && !closing)) break;
+        if (!probe.framingUncertain && !probe.failed && !probe.closed) {
+            [probe pollInput];
+            if (ServicePendingSignals(probe, 0, 0) < 0) break;
         }
+        if (!closing && (probe.closed || probe.failed || probe.peerStopped)) break;
+        NSString *line = ReadLine(probe, MIN(deadline, MonotonicTime() + 0.01), !closing, 0.001);
+        if (!line) continue;
+        if ([line isEqualToString:@"stop"]) continue;
         if ([line isEqualToString:@"media-failed"]) {
             printf("MEDIA_FAILED\n");
             return NO;
         }
-        if (![command isEqualToString:@"media-closed"] && (probe.closed || probe.failed || probe.peerStopped))
-            break;
         if ([command isEqualToString:@"media-ready"] && [line hasPrefix:@"media-ready "]) {
             unsigned int cid = 0, mtu = 0;
             char extra;
@@ -461,8 +636,8 @@ static BOOL WaitControl(DirectPlaybackProbe *probe, NSString *command) {
             return YES;
         }
         if ([line isEqualToString:command]) return YES;
-        NSData *packet = ConsumeSDU(probe, line, deadline);
-        if (!packet || !HandlePeerCommand(probe, packet) || probe.peerStopped) break;
+        printf("UNEXPECTED_CONTROL expected=%s\n", command.UTF8String);
+        break;
     }
     printf("CONTROL_FAILED expected=%s closed=%d\n", command.UTF8String, probe.closed);
     return NO;
@@ -529,6 +704,14 @@ static BOOL PlaybackSequence(DirectPlaybackProbe *probe) {
         printf("CONFIGURATION_ACCEPTED remoteSEID=%u localSourceSEID=1 rate=%u channels=2\n", probe.selectedSink, probe.sampleRate);
         if (probe.stopRequested) break;
         NSData *target = [NSData dataWithBytes:seids length:1];
+        NSData *readback = Query(probe, &transaction, 4, target);
+        NSData *services = ServiceBytes(probe.sampleRate, probe.delayReporting);
+        if (!readback || readback.length != services.length + 2 ||
+            ![[readback subdataWithRange:NSMakeRange(2, services.length)] isEqualToData:services]) {
+            printf("CONFIGURATION_VERIFICATION_FAILED\n");
+            break;
+        }
+        printf("CONFIGURATION_VERIFIED rate=%u channels=2\n", probe.sampleRate);
         if (!EmptyAcceptance(Query(probe, &transaction, 6, target))) break;
         probe.streamOpened = YES;
         probe.mediaExpected = YES;
@@ -549,14 +732,14 @@ static BOOL PlaybackSequence(DirectPlaybackProbe *probe) {
     } while (NO);
     if (!completed && !probe.closed && !probe.failed && !probe.peerStopped && probe.configurationSent) {
         uint8_t target = probe.selectedSink << 2;
-        uint8_t signal = probe.streamOpened || started ? 8 : 10;
+        uint8_t signal = probe.framingUncertain ? 10 : probe.streamOpened || started ? 8 : 10;
         probe.protocolCleanup = YES;
         printf("ERROR_CLEANUP signal=%02X\n", signal);
         BOOL accepted = NO;
-        if (probe.stdinEnded) {
+        if (probe.stdinEnded || probe.framingUncertain) {
             uint8_t request[] = {(uint8_t)(transaction << 4), signal, target};
             SendSignal(probe, [NSData dataWithBytes:request length:sizeof(request)]);
-            printf("PARENT_EOF_CLEANUP signal=%02X acceptance=unverified\n", signal);
+            printf("BEST_EFFORT_CLEANUP signal=%02X acceptance=unverified parentEOF=%d framing_uncertain=%d\n", signal, probe.stdinEnded, probe.framingUncertain);
         } else {
             accepted = EmptyAcceptance(Query(probe, &transaction, signal, [NSData dataWithBytes:&target length:1]));
         }
@@ -567,7 +750,7 @@ static BOOL PlaybackSequence(DirectPlaybackProbe *probe) {
             printf("STREAM_CLOSED cleanupSignal=%02X\n", signal);
         }
     }
-    if (probe.stopRequested && !probe.stdinEnded && !probe.failed && !probe.configurationSent) {
+    if (probe.stopRequested && !probe.stdinEnded && !probe.failed && !probe.framingUncertain && !probe.configurationSent) {
         completed = YES;
         printf("STOP_COMPLETE protocolCleanup=1\n");
     }
@@ -580,21 +763,8 @@ static BOOL PlaybackSequence(DirectPlaybackProbe *probe) {
                 printf("MEDIA_CLOSE_UNCONFIRMED parentEOF=1 CID=%04X\n", probe.mediaCID);
                 return NO;
             }
-            printf("MEDIA_CLOSE_DEADLINE no sends; retaining signaling owner until media-closed\n");
-            for (;;) {
-                NSString *line = ReadLine(probe, INFINITY, NO, 0.001);
-                if (probe.stdinEnded) {
-                    printf("MEDIA_CLOSE_UNCONFIRMED parentEOF=1 CID=%04X\n", probe.mediaCID);
-                    return NO;
-                }
-                if ([line isEqualToString:@"media-closed"]) break;
-                if ([line isEqualToString:@"stop"]) continue;
-                if (line) {
-                    NSData *packet = ConsumeSDU(probe, line, MonotonicTime() + 1);
-                    if (packet && !probe.closed && !probe.failed) HandlePeerCommand(probe, packet);
-                }
-                RunLoopFor(0.05);
-            }
+            printf("MEDIA_CLOSE_UNCONFIRMED deadline=1 CID=%04X\n", probe.mediaCID);
+            return NO;
         }
         printf("MEDIA_CLOSED_CONFIRMED CID=%04X\n", probe.mediaCID);
     }
@@ -679,118 +849,106 @@ static BOOL SelfTest(void) {
         !ParseSampleRate("96000x", &parsedRate) && !ParseSampleRate("32000", &parsedRate) &&
         !ParseSampleRate("4294967296", &parsedRate);
     passed &= !EmptyAcceptance(actual) && EmptyAcceptance([NSData dataWithBytes:closeAccept length:2]);
-    probe.pending = [NSMutableData data];
-    probe.raw = [NSMutableData data];
-    probe.playback = YES;
-    probe.realCID = 0x500C;
-    probe.closing = YES;
-    NSData *closingSDU = [NSData dataWithBytes:closeAccept length:sizeof(closeAccept)];
-    probe.input = [NSInputStream inputStreamWithData:closingSDU];
-    [probe.input open];
-    passed &= [ConsumeSDU(probe, @"0x500C 2", MonotonicTime() + 1) isEqualToData:closingSDU] &&
-        !probe.failed && !probe.pending.length && [probe.raw isEqualToData:closingSDU];
-    [probe.input close];
-    probe.input = [NSInputStream inputStreamWithData:[NSData data]];
-    [probe.input open];
-    uint8_t emptyByte;
-    [probe.input read:&emptyByte maxLength:1];
-    probe.closing = YES;
-    [probe pollInput];
-    passed &= !probe.failed;
-    probe.closing = NO;
-    [probe pollInput];
-    passed &= probe.failed;
-    [probe.input close];
+
     return passed;
 }
 
-static void WaitTransportClosed(DirectPlaybackProbe *probe) {
-    printf("WAIT_TRANSPORT_CLOSED CID=%04X\n", probe.realCID);
-    double deadline = MonotonicTime() + 2;
-    BOOL warned = NO;
-    while (!probe.closed) {
-        NSString *line = ReadLine(probe, MonotonicTime() + 0.25, NO, 0.001);
-        if ([line isEqualToString:@"transport-closed"]) {
-            probe.closed = YES;
-            printf("TRANSPORT_CLOSED_CONFIRMED time=%.6f CID=%04X source=daemon-gate\n",
-                   NSDate.date.timeIntervalSince1970, probe.realCID);
-        } else if ([line isEqualToString:@"stop"]) {
-            continue;
-        } else if (line) {
-            NSData *packet = ConsumeSDU(probe, line, MonotonicTime() + 1);
-            if (packet) {
-                printf("CLOSING_SDU CID=%04X length=%lu replies=0\n", probe.realCID, packet.length);
-            } else {
-                printf("UNEXPECTED_TRANSPORT_CLOSE_CONTROL line=%s\n", line.UTF8String);
-                probe.failed = YES;
-            }
-        }
-        [probe pollInput];
-        if (probe.stdinEnded && probe.inputEnded) {
-            probe.closed = YES;
-            printf("TRANSPORT_CLOSED_CONFIRMED time=%.6f CID=%04X source=owned-input-eof\n",
-                   NSDate.date.timeIntervalSince1970, probe.realCID);
-        }
-        if (probe.stdinEnded && !probe.closed && MonotonicTime() >= deadline) {
-            printf("TRANSPORT_CLOSE_UNCONFIRMED CID=%04X parentEOF=1 closeRequested=1\n", probe.realCID);
-            probe.failed = YES;
-            break;
-        }
-        if (!probe.closed && !warned && MonotonicTime() >= deadline) {
-            printf("CLOSE_PENDING retaining channel and coordinator until callback or transport-closed\n");
-            warned = YES;
-        }
-        if (!probe.closed) RunLoopFor(0.001);
+static BOOL RecordOpen(DirectPlaybackProbe *probe, CBL2CAPChannel *channel, NSInteger error) {
+    if (!probe.openRequested || probe.openDone || (channel && channel.PSM != 0x19)) {
+        probe.failed = YES;
+        return NO;
     }
+    probe.channel = channel;
+    probe.realCID = channel.cid;
+    probe.openError = error;
+    probe.openDone = YES;
+    probe.openIndeterminate = !channel && !error;
+    if (probe.openIndeterminate) printf("OPEN_INDETERMINATE nil_channel=1 callback_status=0\n");
+    BOOL opened = !error && channel && channel.cid && channel.outgoingMTU >= 2 && channel.inputStream && channel.outputStream;
+    if (opened) printf("OWNED_OPEN CID=%04X outgoingMTU=%u\n", channel.cid, channel.outgoingMTU);
+    return opened;
+}
+
+static BOOL RecordClosed(DirectPlaybackProbe *probe, CBL2CAPChannel *channel, NSInteger error) {
+    BOOL matched = channel && channel == probe.channel && channel.PSM == 0x19 && channel.cid == probe.realCID;
+    printf("CLOSE_CALLBACK status=%ld owned_match=%d\n", error, matched);
+    if (matched && !probe.closed) {
+        probe.closed = YES;
+        printf("OWNED_CLOSED CID=%04X\n", probe.realCID);
+    } else probe.failed = YES;
+    return matched;
+}
+
+static BOOL WaitTransportClosed(DirectPlaybackProbe *probe) {
+    double deadline = MIN(probe.hardDeadline, MonotonicTime() + 5);
+    printf("WAIT_TRANSPORT_CLOSED CID=%04X\n", probe.realCID);
+    while (!probe.closed && MonotonicTime() < deadline) {
+        NSString *line = ReadLine(probe, MIN(deadline, MonotonicTime() + 0.01), NO, 0.001);
+        if (line && ![line isEqualToString:@"stop"]) probe.failed = YES;
+        [probe pollInput];
+        RunLoopFor(0.001);
+    }
+    if (!probe.closed) {
+        printf("TRANSPORT_CLOSE_UNCONFIRMED CID=%04X closeRequested=1\n", probe.realCID);
+        probe.failed = YES;
+    }
+    return probe.closed;
+}
+
+static BOOL AcquisitionTrigger(NSString *line, uint64_t armed, uint64_t now) {
+    uint64_t baseline = 0, connected = 0;
+    int consumed = 0;
+    if (sscanf(line.UTF8String, "acquire %" SCNu64 " %" SCNu64 "%n", &baseline, &connected, &consumed) != 2 ||
+        line.UTF8String[consumed]) return NO;
+    return baseline >= armed && connected > baseline && connected <= now && now - connected <= NSEC_PER_SEC;
+}
+
+static const char *RefreshOwnedPeer(CBClassicPeer *peer, CBClassicManager *manager) {
+    if (peer.manager != manager || [manager peerWithIdentifier:peer.identifier] != peer) return "owned_peer_refresh_owner_mismatch";
+    id reply = [peer sendInternalSyncMsg:0x2f args:nil];
+    if (![reply isKindOfClass:NSDictionary.class]) return "owned_peer_refresh_invalid_reply";
+    id state = reply[@"kCBMsgArgState"];
+    if (![state isKindOfClass:NSDictionary.class]) return "owned_peer_refresh_invalid_reply";
+    id number = state[@"kCBMsgArgInternalState"];
+    if (![number isKindOfClass:NSNumber.class]) return "owned_peer_refresh_invalid_reply";
+    if (![number isEqualToNumber:@2]) return "owned_peer_refresh_not_connected";
+    if (peer.manager != manager || [manager peerWithIdentifier:peer.identifier] != peer) return "owned_peer_refresh_owner_mismatch";
+    [peer handleGetPeerState:reply];
+    if (peer.manager != manager || [manager peerWithIdentifier:peer.identifier] != peer) return "owned_peer_refresh_owner_mismatch";
+    return peer.internalState == 2 ? NULL : "owned_peer_refresh_update_failed";
 }
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
+        if (argc == 2 && !strcmp(argv[1], "--self-test")) {
             BOOL passed = SelfTest();
             printf("offline parser checks=%s\n", passed ? "PASS" : "FAIL");
             return passed ? 0 : 1;
         }
-        BOOL playback = argc >= 3 && strcmp(argv[1], "--playback-disconnected") == 0;
-#if ACOUPLET_LDAC_PROBE_ONLY
-        BOOL capabilities = argc >= 3 && strcmp(argv[1], "--capabilities-disconnected") == 0;
-        BOOL discover = argc >= 2 && (strcmp(argv[1], "--discover") == 0 || strcmp(argv[1], "--discover-disconnected") == 0);
-#endif
-        NSString *address = nil;
+        BOOL valid = argc >= 3 && !strcmp(argv[1], "--playback-disconnected");
+        NSString *address = nil, *quality = @"low";
         uint32_t sampleRate = 48000;
-        NSString *quality = @"low";
-        BOOL addressSeen = NO;
-        BOOL rateSeen = NO, qualitySeen = NO;
-        BOOL continuous = NO;
-#if ACOUPLET_LDAC_PROBE_ONLY
-        BOOL argumentsValid = capabilities || playback || discover;
-        int firstOption = capabilities || playback ? 3 : 2;
-#else
-        BOOL argumentsValid = playback;
-        int firstOption = 3;
-#endif
-        for (int index = firstOption; argumentsValid && index < argc; index++) {
-            if (!strcmp(argv[index], "--address") && !addressSeen && index + 1 < argc) {
+        BOOL rateSeen = NO, qualitySeen = NO, continuousSeen = NO;
+        for (int index = 3; valid && index < argc; index++) {
+            if (!strcmp(argv[index], "--address") && !address && index + 1 < argc) {
                 address = NormalizeAddress(argv[++index]);
-                addressSeen = YES;
-                argumentsValid = address != nil;
-            } else if (!strcmp(argv[index], "--continuous") && playback && !continuous) {
-                continuous = YES;
+                valid = address != nil;
             } else if (!strcmp(argv[index], "--sample-rate") && !rateSeen && index + 1 < argc) {
-                argumentsValid = ParseSampleRate(argv[++index], &sampleRate);
                 rateSeen = YES;
+                valid = ParseSampleRate(argv[++index], &sampleRate);
             } else if (!strcmp(argv[index], "--quality") && !qualitySeen && index + 1 < argc) {
-                quality = [NSString stringWithUTF8String:argv[++index]];
-                argumentsValid = quality && [@[@"auto", @"low", @"mid", @"high"] containsObject:quality];
                 qualitySeen = YES;
-            } else argumentsValid = NO;
+                quality = [NSString stringWithUTF8String:argv[++index]];
+                valid = [@[@"auto", @"low", @"mid", @"high"] containsObject:quality];
+            } else if (!strcmp(argv[index], "--continuous") && !continuousSeen) continuousSeen = YES;
+            else valid = NO;
         }
 #if !ACOUPLET_LDAC_PROBE_ONLY
-        argumentsValid &= continuous;
+        valid &= continuousSeen;
 #endif
-        if (!argumentsValid || !addressSeen) {
+        if (!valid || !address) {
 #if ACOUPLET_LDAC_PROBE_ONLY
-            fprintf(stderr, "Usage: %s --discover|--discover-disconnected OR --capabilities-disconnected|--playback-disconnected received.bin --address XX-XX-XX-XX-XX-XX [--continuous for playback] [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high]\n", argv[0]);
+            fprintf(stderr, "Usage: %s --playback-disconnected received.bin --address XX-XX-XX-XX-XX-XX [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high] [--continuous]\n", argv[0]);
 #else
             fprintf(stderr, "Usage: %s --playback-disconnected received.bin --address XX-XX-XX-XX-XX-XX --continuous [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high]\n", argv[0]);
 #endif
@@ -798,173 +956,143 @@ int main(int argc, const char *argv[]) {
         }
         if (!LDACWatchParent(20)) return 3;
         setbuf(stdout, NULL);
+        signal(SIGINT, Stop);
+        signal(SIGTERM, Stop);
+        signal(SIGPIPE, SIG_IGN);
+        if (!continuousSeen) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            const char message[] = "HARD_DEADLINE cleanup=unconfirmed\n";
+            write(STDOUT_FILENO, message, sizeof(message) - 1);
+            _exit(24);
+        });
         IOBluetoothDevice *device = [IOBluetoothDevice deviceWithAddressString:address];
-        printf("BEFORE time=%.6f device=%p address=%s paired=%d connected=%d\n",
-               NSDate.date.timeIntervalSince1970, (__bridge void *)device,
-               device.addressString.UTF8String, device.isPaired, SonyClassicIsConnected(device));
-        if (!device || !device.isPaired || !SonyClassicIsConnected(device)) {
-            printf("NO_OPEN direct stream acquisition requires an already-paired connected target\n");
+        if (!device || !device.isPaired) {
+            printf("NO_OPEN reason=target_not_paired\n");
             return 3;
         }
-        CBClassicPeer *peer __attribute__((objc_precise_lifetime)) = device.classicPeer;
-        if (!peer) {
-            printf("NO_OPEN coordinator returned no Classic peer\n");
+        Class managerClass = NSClassFromString(@"CBClassicManager");
+        for (NSString *selector in @[@"initWithQueue:options:", @"tccApproved", @"tccComplete", @"tccRequired", @"checkForTCC", @"retrievePeerWithAddress:", @"peerWithIdentifier:"]) {
+            if (![managerClass instancesRespondToSelector:NSSelectorFromString(selector)]) {
+                printf("NO_OPEN reason=classic_manager_interface_unavailable\n");
+                return 4;
+            }
+        }
+        CBClassicManager *manager __attribute__((objc_precise_lifetime)) =
+            [[managerClass alloc] initWithQueue:dispatch_get_main_queue() options:nil];
+        double deadline = MonotonicTime() + 5;
+        BOOL authorizationRequested = NO;
+        while (manager && !manager.tccApproved && !interrupted && MonotonicTime() < deadline) {
+            if (manager.state == CBManagerStatePoweredOn && !manager.tccRequired && !manager.tccComplete && !authorizationRequested) {
+                authorizationRequested = YES;
+                [manager checkForTCC];
+            }
+            RunLoopFor(0.01);
+        }
+        if (!manager.tccApproved || interrupted) {
+            printf("NO_OPEN reason=classic_manager_not_ready\n");
             return 4;
         }
-        printf("SCOPE direct Classic coordinator stream owner; historical disconnected CLI requires connected ACL\n");
-        printf("TARGET owner=IOBluetoothCoordinator address=%s UUID=%s\n", device.addressString.UTF8String,
-               peer.identifier.UUIDString.UTF8String);
+        CBClassicPeer *peer __attribute__((objc_precise_lifetime)) =
+            [manager retrievePeerWithAddress:[address stringByReplacingOccurrencesOfString:@"-" withString:@":"]];
+        for (NSString *selector in @[@"internalState", @"manager", @"sendInternalSyncMsg:args:", @"handleGetPeerState:",
+            @"connectL2CAPCallback", @"disconnectL2CAPCallback", @"setConnectL2CAPCallback:", @"setDisconnectL2CAPCallback:",
+            @"openL2CAPChannel:", @"closeL2CAPChannel:"]) {
+            if (![peer respondsToSelector:NSSelectorFromString(selector)]) {
+                printf("NO_OPEN reason=classic_peer_interface_unavailable\n");
+                return 4;
+            }
+        }
+        Method refreshQuery = class_getInstanceMethod(peer.class, @selector(sendInternalSyncMsg:args:));
+        Method refreshHandler = class_getInstanceMethod(peer.class, @selector(handleGetPeerState:));
+        if (!refreshQuery || strcmp(method_getTypeEncoding(refreshQuery), "@28@0:8i16@20") ||
+            !refreshHandler || strcmp(method_getTypeEncoding(refreshHandler), "v24@0:8@16")) {
+            printf("NO_OPEN reason=unexpected_peer_refresh_abi\n");
+            return 4;
+        }
+        if (peer.manager != manager || [manager peerWithIdentifier:peer.identifier] != peer ||
+            peer.connectL2CAPCallback || peer.disconnectL2CAPCallback) {
+            printf("NO_OPEN reason=classic_peer_not_owned\n");
+            return 4;
+        }
         DirectPlaybackProbe *probe __attribute__((objc_precise_lifetime)) = [DirectPlaybackProbe new];
         probe.pending = [NSMutableData data];
         probe.raw = [NSMutableData data];
         probe.controlPending = [NSMutableData data];
-        probe.playback = playback;
-        probe.continuous = continuous;
         probe.sampleRate = sampleRate;
         probe.quality = quality;
-        __block BOOL openDone = NO;
-        __block NSInteger openError = 0;
-        peer.connectL2CAPCallback = ^(CBL2CAPChannel *value, NSInteger error) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                printf("OPEN_CALLBACK time=%.6f status=0x%08X\n", NSDate.date.timeIntervalSince1970, (unsigned int)error);
-                PrintChannel("OPEN_CALLBACK_CHANNEL", value);
-                if (openDone || (value && value.PSM != 0x0019)) {
-                    probe.failed = YES;
-                    openError = -1;
-                    openDone = YES;
-                    return;
-                }
-                probe.channel = value;
-                probe.realCID = value.cid;
-                openError = error;
-                openDone = YES;
-            });
+        probe.continuous = continuousSeen;
+        probe.hardDeadline = continuousSeen ? INFINITY : MonotonicTime() + 140;
+        void (^ownedOpen)(CBL2CAPChannel *, NSInteger) = [^(CBL2CAPChannel *value, NSInteger error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ RecordOpen(probe, value, error); });
+        } copy];
+        void (^ownedClose)(CBL2CAPChannel *, NSInteger) = [^(CBL2CAPChannel *value, NSInteger error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ RecordClosed(probe, value, error); });
+        } copy];
+        peer.connectL2CAPCallback = ownedOpen;
+        peer.disconnectL2CAPCallback = ownedClose;
+        probe.callbacksIntact = ^BOOL {
+            BOOL intact = peer.manager == manager && [manager peerWithIdentifier:peer.identifier] == peer &&
+                peer.connectL2CAPCallback == ownedOpen && peer.disconnectL2CAPCallback == ownedClose;
+            if (!intact) printf("OWNED_CALLBACKS_LOST cleanup=unconfirmed\n");
+            return intact;
         };
-        peer.disconnectL2CAPCallback = ^(CBL2CAPChannel *value, NSInteger error) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                PrintChannel("CLOSED_CALLBACK", value);
-                printf("DIRECT_CLOSE_CALLBACK status=0x%08X\n", (unsigned int)error);
-                if (probe.channel && value && value.PSM == 0x0019 && value.cid == probe.realCID)
-                    probe.closed = YES;
-            });
-        };
-        NSString *initialControl = playback ? ReadLine(probe, MonotonicTime() + 0.001, NO, 0.001) : nil;
-        if (initialControl && ![initialControl isEqualToString:@"stop"]) probe.failed = YES;
-        printf("OPEN_BEGIN time=%.6f PSM=0019\n", NSDate.date.timeIntervalSince1970);
-        if (!probe.stopRequested && !probe.failed) [peer openL2CAPChannel:0x0019];
-        else openDone = YES;
-        double openDeadline = MonotonicTime() + 5;
-        while (!openDone && !probe.stopRequested && !probe.failed && MonotonicTime() < openDeadline) {
-            NSString *control = playback ? ReadLine(probe, MonotonicTime() + 0.001, NO, 0.001) : nil;
-            if (control && ![control isEqualToString:@"stop"]) probe.failed = YES;
-            RunLoopFor(0.001);
-        }
-        BOOL openExpired = !openDone;
-        if (openExpired) {
-            printf("OPEN_DEADLINE no sends; retaining owner until terminal open callback\n");
-            double cancelDeadline = MonotonicTime() + 5;
-            while (!openDone) {
-                NSString *control = playback ? ReadLine(probe, MonotonicTime() + 0.001, NO, 0.001) : nil;
-                if (control && ![control isEqualToString:@"stop"]) probe.failed = YES;
-                if ((probe.stopRequested || probe.failed) && MonotonicTime() >= cancelDeadline) {
-                    printf("OPEN_CANCELLATION_UNCONFIRMED callback=0\n");
-                    probe.failed = YES;
-                    break;
-                }
-                RunLoopFor(0.05);
-            }
-        }
-        printf("OPEN_RETURN time=%.6f status=0x%08X paired=%d connected=%d\n",
-               NSDate.date.timeIntervalSince1970, (unsigned int)openError, device.isPaired, SonyClassicIsConnected(device));
-        CBL2CAPChannel *channel __attribute__((objc_precise_lifetime)) = probe.channel;
-        PrintChannel("RETURNED_CHANNEL", channel);
-        int result = probe.stopRequested && !probe.stdinEnded && !probe.failed ? 0 : 5;
-        if (channel) {
-            printf("OWNED_CHANNEL time=%.6f channel=%p CID=%04X outgoingMTU=%u\n",
-                   NSDate.date.timeIntervalSince1970, (__bridge void *)channel, channel.cid, channel.outgoingMTU);
-        }
-        if (!openExpired && !openError && channel && channel.PSM == 0x0019 && probe.realCID &&
-            channel.outgoingMTU >= 2 && !probe.closed && !probe.failed && !probe.stopRequested) {
-            probe.input = channel.inputStream;
-            probe.output = channel.outputStream;
-            [probe.input open];
-            [probe.output open];
-            printf("SIGNAL_WRITER fd=%d MTU=%u mode=public-stream\n", channel.socketFD, channel.outgoingMTU);
-#if ACOUPLET_LDAC_PROBE_ONLY
-            if (playback) {
-                result = PlaybackSequence(probe) ? 0 : 5;
-            } else if (capabilities) {
-                NSArray<NSNumber *> *sinks = @[];
-                for (NSUInteger index = 0; index <= sinks.count; index++) {
-                    uint8_t transaction = (uint8_t)(index + 1);
-                    uint8_t signal = index ? 0x0C : 1;
-                    uint8_t seid = index ? sinks[index - 1].unsignedCharValue : 0;
-                    uint8_t packet[] = {(uint8_t)(transaction << 4), signal, (uint8_t)(seid << 2)};
-                    UInt16 packetLength = index ? 3 : 2;
-                    if (index >= 15 || probe.closed || probe.failed || probe.pending.length ||
-                        probe.stopRequested ||
-                        channel != probe.channel || channel.PSM != 0x0019 || channel.outgoingMTU < packetLength) break;
-                    if (!SendSignal(probe, [NSData dataWithBytes:packet length:packetLength])) break;
-                    NSData *reply = FramedReply(probe, MonotonicTime() + 30);
-                    NSArray<NSNumber *> *decoded = reply ? DecodeReply(reply, transaction, signal, seid, YES) : nil;
-                    if (!decoded) {
-                        printf("RESPONSE_INVALID transaction=%u signal=%02X SEID=%u\n", transaction, signal, seid);
-                        break;
-                    }
-                    printf("RESPONSE_ACCEPTED transaction=%u signal=%02X SEID=%u length=%lu CID=%04X\n",
-                           transaction, signal, seid, reply.length, probe.realCID);
-                    if (!index) sinks = decoded;
-                    if (index == sinks.count) result = 0;
-                }
-            } else {
-                const uint8_t request[] = {0x10, 0x01};
-                if (SendSignal(probe, [NSData dataWithBytes:request length:sizeof(request)])) {
-                    double deadline = MonotonicTime() + 3;
-                    while (!probe.closed && !probe.failed && MonotonicTime() < deadline) {
-                        [probe pollInput];
-                        RunLoopFor(0.001);
-                    }
-                    if (probe.received) result = 0;
-                }
-            }
-#else
-            result = PlaybackSequence(probe) ? 0 : 5;
-#endif
-            printf("SIGNAL_WRITER_RESTORE restored=1 closed=%d mode=public-stream optionsChanged=0\n", probe.closed);
+        uint64_t armed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        printf("SIGNALING_ARMED time_ns=%" PRIu64 "\n", armed);
+        NSString *acquire = ReadLine(probe, MonotonicTime() + 50, YES, 0.001);
+        BOOL triggered = acquire && AcquisitionTrigger(acquire, armed, clock_gettime_nsec_np(CLOCK_MONOTONIC));
+        const char *refreshFailure = triggered ? RefreshOwnedPeer(peer, manager) : "missing_or_invalid_fresh_acl_trigger";
+        int result = 5;
+        if (refreshFailure || probe.stopRequested || probe.failed || probe.stdinEnded) {
+            printf("NO_OPEN reason=%s\n", refreshFailure ?: "canceled_or_owner_unavailable");
+            if (probe.stopRequested && !probe.failed && !probe.stdinEnded) result = 0;
         } else {
-            printf("NO_PLAYBACK realCID=%04X owned=%p openExpired=%d openError=%ld\n",
-                   probe.realCID, (__bridge void *)channel, openExpired, openError);
-        }
-        if (channel && !probe.closed) {
-            printf("CLOSE_BEGIN time=%.6f\n", NSDate.date.timeIntervalSince1970);
-            probe.closing = YES;
-            [peer closeL2CAPChannel:0x0019];
-            printf("CLOSE_RETURN time=%.6f requested=1\n", NSDate.date.timeIntervalSince1970);
-            WaitTransportClosed(probe);
+            probe.openRequested = YES;
+            printf("OPEN_BEGIN PSM=0019\n");
+            [peer openL2CAPChannel:0x19];
+            deadline = MonotonicTime() + 5;
+            while (!probe.openDone && !probe.stopRequested && !probe.failed && MonotonicTime() < deadline) {
+                NSString *line = ReadLine(probe, MIN(deadline, MonotonicTime() + 0.01), NO, 0.001);
+                if (line && ![line isEqualToString:@"stop"]) probe.failed = YES;
+            }
+            BOOL expired = !probe.openDone;
+            if (expired) {
+                printf("OPEN_PENDING cancel_or_deadline=1 retaining_owner=1\n");
+                deadline = MonotonicTime() + 5;
+                while (!probe.openDone && MonotonicTime() < deadline) {
+                    ReadLine(probe, MIN(deadline, MonotonicTime() + 0.01), NO, 0.001);
+                    RunLoopFor(0.001);
+                }
+            }
+            CBL2CAPChannel *channel = probe.channel;
+            if (!expired && !probe.openError && channel && channel.PSM == 0x19 && probe.realCID &&
+                channel.outgoingMTU >= 2 && channel.inputStream && channel.outputStream &&
+                !probe.closed && !probe.failed && !probe.stopRequested) {
+                probe.input = channel.inputStream;
+                probe.output = channel.outputStream;
+                [probe.input open];
+                [probe.output open];
+                printf("SIGNAL_WRITER fd=%d MTU=%u mode=public-stream\n", channel.socketFD, channel.outgoingMTU);
+                result = PlaybackSequence(probe) ? 0 : 5;
+            }
+            if (channel && !probe.closed) {
+                probe.closing = YES;
+                [peer closeL2CAPChannel:0x19];
+                if (!WaitTransportClosed(probe)) result = 5;
+            }
+            if (!probe.openDone || probe.openIndeterminate) {
+                printf("OPEN_CLEANUP_UNCONFIRMED pending=%d indeterminate=%d\n", !probe.openDone, probe.openIndeterminate);
+                result = 5;
+            }
         }
         [probe.input close];
         [probe.output close];
-        peer.connectL2CAPCallback = nil;
-        peer.disconnectL2CAPCallback = nil;
-        printf("DELEGATE_CLEAR time=%.6f status=0x%08X\n", NSDate.date.timeIntervalSince1970, 0);
-#if ACOUPLET_LDAC_PROBE_ONLY
-        if (capabilities || playback) {
-#else
-        {
-#endif
-            NSError *error = nil;
-            BOOL saved = [probe.raw writeToFile:[NSString stringWithUTF8String:argv[2]]
-                                       options:NSDataWritingAtomic error:&error];
-            printf("RAW_SAVE path=%s bytes=%lu saved=%d\n", argv[2], probe.raw.length, saved);
-            if (!saved) {
-                fprintf(stderr, "%s\n", error.description.UTF8String);
-                result = 5;
-            }
-            if (probe.failed || probe.pending.length) result = 5;
-        }
-        printf("AFTER time=%.6f result=%d received=%lu closed=%d paired=%d connected=%d\n",
-               NSDate.date.timeIntervalSince1970, result, probe.received, probe.closed,
-               device.isPaired, SonyClassicIsConnected(device));
+        probe.callbacksIntact = nil;
+        if (peer.connectL2CAPCallback == ownedOpen) peer.connectL2CAPCallback = nil;
+        if (peer.disconnectL2CAPCallback == ownedClose) peer.disconnectL2CAPCallback = nil;
+        NSError *error = nil;
+        BOOL saved = [probe.raw writeToFile:[NSString stringWithUTF8String:argv[2]] options:NSDataWritingAtomic error:&error];
+        if (!saved || probe.failed || probe.pending.length || probe.framingUncertain) result = 5;
+        printf("SIGNALING_COMPLETE result=%d raw_bytes=%lu received_bytes=%lu pending_bytes=%lu framing_uncertain=%d owned_closed=%d saved=%d\n",
+               result, probe.raw.length, probe.received, probe.pending.length, probe.framingUncertain, probe.closed, saved);
         return result;
     }
 }

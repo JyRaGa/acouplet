@@ -28,6 +28,49 @@ static double MonotonicTime(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000000000.0;
 }
 
+static int FreshACLState(IOBluetoothDevice *device, uint64_t *sampleTime) {
+    SEL peerSelector = NSSelectorFromString(@"classicPeer");
+    NSMethodSignature *peerSignature = [device methodSignatureForSelector:peerSelector];
+    if (!peerSignature || peerSignature.numberOfArguments != 2 || strcmp(peerSignature.methodReturnType, "@")) {
+        printf("ACL_OBSERVATION_FAILED reason=peer-selector\n");
+        return -1;
+    }
+    id (*getPeer)(id, SEL) = (void *)[device methodForSelector:peerSelector];
+    id peer = getPeer(device, peerSelector);
+    SEL querySelector = NSSelectorFromString(@"sendInternalSyncMsg:args:");
+    NSMethodSignature *querySignature = [peer methodSignatureForSelector:querySelector];
+    if (!querySignature || querySignature.numberOfArguments != 4 || strcmp(querySignature.methodReturnType, "@") ||
+        strcmp([querySignature getArgumentTypeAtIndex:2], "i") || strcmp([querySignature getArgumentTypeAtIndex:3], "@")) {
+        printf("ACL_OBSERVATION_FAILED reason=query-selector\n");
+        return -1;
+    }
+    id (*query)(id, SEL, int, id) = (void *)[peer methodForSelector:querySelector];
+    id reply = query(peer, querySelector, 0x2f, nil);
+    *sampleTime = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (![reply isKindOfClass:NSDictionary.class]) {
+        printf("ACL_OBSERVATION_FAILED reason=reply-shape\n");
+        return -1;
+    }
+    id result = reply[@"kCBMsgArgResult"];
+    if (result && (![result isKindOfClass:NSNumber.class] ||
+                   CFGetTypeID((__bridge CFTypeRef)result) == CFBooleanGetTypeID() || ![result isEqualToNumber:@0])) {
+        printf("ACL_OBSERVATION_FAILED reason=query-result\n");
+        return -1;
+    }
+    id state = reply[@"kCBMsgArgState"];
+    if (![state isKindOfClass:NSDictionary.class]) {
+        printf("ACL_OBSERVATION_FAILED reason=state-shape\n");
+        return -1;
+    }
+    id number = state[@"kCBMsgArgInternalState"];
+    if (![number isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)number) == CFBooleanGetTypeID() ||
+        (![number isEqualToNumber:@0] && ![number isEqualToNumber:@2])) {
+        printf("ACL_OBSERVATION_FAILED reason=state-value\n");
+        return -1;
+    }
+    return [number intValue];
+}
+
 static NSString *NormalizeAddress(const char *value) {
     if (!value || strlen(value) != 17 || (value[2] != ':' && value[2] != '-')) return nil;
     for (NSUInteger index = 0; index < 17; index++) {
@@ -169,6 +212,7 @@ static int PriorityIdle(NSString *uid) {
 @property BOOL disconnected;
 @property BluetoothConnectionHandle originalHandle;
 @property IOBluetoothUserNotification *disconnectNotification;
+@property BOOL nativeAudioPresent;
 @end
 @implementation ConnectionObserver
 - (void)connectionComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
@@ -184,6 +228,17 @@ static int PriorityIdle(NSString *uid) {
     printf("CONNECTION_DISCONNECTED handle=%04X connected=%d\n", self.originalHandle, SonyClassicIsConnected(device));
 }
 @end
+
+static int ObserveNativeOutput(NSString *address, ConnectionObserver *observer) {
+    int native = NativeOutputState(address);
+    if (native == 1 && !observer.nativeAudioPresent) {
+        observer.nativeAudioPresent = YES;
+        printf("NATIVE_AUDIO_PRESENT time_ns=%llu\n", (unsigned long long)clock_gettime_nsec_np(CLOCK_MONOTONIC));
+    } else if (native < 0) {
+        printf("NATIVE_AUDIO_UNCONFIRMED reason=output-inspection\n");
+    }
+    return native;
+}
 
 static int WatchConnection(IOBluetoothDevice *device, ConnectionObserver *observer, NSString *address, NSString *priorityUID, int parentEvents) {
     printf("CONNECT_READY handle=%04X guarded=1\n", observer.originalHandle);
@@ -202,6 +257,10 @@ static int WatchConnection(IOBluetoothDevice *device, ConnectionObserver *observ
             return 0;
         }
         if (parentExited) break;
+        if (ObserveNativeOutput(address, observer) < 0) {
+            [observer.disconnectNotification unregister];
+            return 6;
+        }
         RunLoopFor(0.1);
     }
     alarm(80);
@@ -381,6 +440,33 @@ int main(int argc, const char *argv[]) {
             printf("CONNECT_CANCELED issued=0 settled=1\n");
             return 0;
         }
+        uint64_t baselineTime = 0;
+        if (watchParent) {
+            double baselineDeadline = MonotonicTime() + 5;
+            while (YES) {
+                int native = NativeOutputState(address);
+                int fresh = FreshACLState(device, &baselineTime);
+                if (fresh < 0) return 4;
+                if (fresh != 0 || SonyClassicIsConnected(device)) {
+                    printf("ACL_OBSERVATION_FAILED reason=baseline-connected\n");
+                    return 4;
+                }
+                if (native < 0) {
+                    printf("NATIVE_AUDIO_UNCONFIRMED reason=baseline-output-inspection\n");
+                    return 6;
+                }
+                if (ParentInputEnded() || ParentExited(parentEvents)) {
+                    printf("CONNECT_CANCELED issued=0 settled=1\n");
+                    return 0;
+                }
+                if (native == 0) break;
+                if (MonotonicTime() >= baselineDeadline) {
+                    printf("ACL_OBSERVATION_FAILED reason=baseline-native-output-present\n");
+                    return 6;
+                }
+                RunLoopFor(0.01);
+            }
+        }
         ConnectionObserver *observer = [ConnectionObserver new];
         if (watchParent) {
             observer.disconnectNotification = [device registerForDisconnectNotification:observer selector:@selector(disconnected:device:)];
@@ -391,11 +477,35 @@ int main(int argc, const char *argv[]) {
         if (status != kIOReturnSuccess) return 3;
         double deadline = restore ? restoreDeadline : MonotonicTime() + 45;
         BOOL cancelled = NO;
-        while (!observer.done && MonotonicTime() < deadline) {
-            if (watchParent && (ParentInputEnded() || ParentExited(parentEvents))) {
+        BOOL aclConnected = NO;
+        int acquisitionFailure = 0;
+        while (observer.done || MonotonicTime() < deadline) {
+            if (watchParent && !observer.done && (ParentInputEnded() || ParentExited(parentEvents))) {
                 cancelled = YES;
                 break;
             }
+            if (watchParent && (!observer.done || observer.status == kIOReturnSuccess)) {
+                uint64_t connectedTime = 0;
+                int fresh = FreshACLState(device, &connectedTime);
+                if (fresh < 0 || observer.disconnected || (aclConnected && fresh == 0) || (observer.done && fresh != 2)) {
+                    if (fresh >= 0) printf("ACL_OBSERVATION_FAILED reason=%s\n",
+                                          observer.disconnected ? "original-connection-ended" : aclConnected ? "epoch-retired" : "callback-without-fresh-acl");
+                    acquisitionFailure = 4;
+                    cancelled = YES;
+                    break;
+                }
+                if (ObserveNativeOutput(address, observer) < 0) {
+                    acquisitionFailure = 6;
+                    cancelled = YES;
+                    break;
+                }
+                if (!aclConnected && fresh == 2) {
+                    aclConnected = YES;
+                    printf("ACL_CONNECTED baseline_ns=%llu connected_ns=%llu\n",
+                           (unsigned long long)baselineTime, (unsigned long long)connectedTime);
+                }
+            }
+            if (observer.done) break;
             RunLoopFor(0.01);
         }
         if (cancelled) {
@@ -405,7 +515,7 @@ int main(int argc, const char *argv[]) {
             while (MonotonicTime() < cancelDeadline) {
                 if (observer.disconnected || (observer.done && SonyClassicIsConnected(device) && device.connectionHandle != observer.originalHandle)) {
                     printf("CONNECT_CANCELED callback=%d originalDisconnected=%d retired=1\n", observer.done, observer.disconnected);
-                    return 0;
+                    return acquisitionFailure;
                 }
                 if (observer.done && observer.status == kIOReturnSuccess && SonyClassicIsConnected(device) && !closeRequested) {
                     closeRequested = YES;
@@ -414,7 +524,7 @@ int main(int argc, const char *argv[]) {
                 }
                 if (observer.done && !SonyClassicIsConnected(device) && closeStatus == kIOReturnSuccess) {
                     printf("CONNECT_CANCELED callback=1 disconnected=1 settled=1\n");
-                    return 0;
+                    return acquisitionFailure;
                 }
                 RunLoopFor(0.01);
             }

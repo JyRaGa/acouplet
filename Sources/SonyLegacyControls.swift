@@ -179,6 +179,17 @@ struct SonyLegacyConnectionQuality: Equatable, Sendable {
         return setPayload(SonyConnectionMode(rawValue: payload[3])) == payload
     }
 
+    mutating func invalidateRead(_ query: [UInt8]) {
+        switch query {
+        case [0xE0, 0x01]: settingType = nil
+        case [0xE2, 0x01]: available = nil
+        case [0xE6, 0x01]:
+            parameterSettingType = nil
+            mode = nil
+        default: break
+        }
+    }
+
     @discardableResult
     mutating func update(_ payload: [UInt8]) -> Bool {
         guard isSupported, payload.count >= 3, payload[1] == 0x01 else { return false }
@@ -280,6 +291,7 @@ struct SonyLegacyControls: Equatable, Sendable {
     private(set) var automaticPowerOff: SonyAutomaticPowerOffState?
 
     mutating func invalidateSystemRead(_ query: [UInt8]) {
+        connectionQuality.invalidateRead(query)
         wearingControl.invalidateRead(query)
         automaticPowerOff?.invalidateRead(query)
     }

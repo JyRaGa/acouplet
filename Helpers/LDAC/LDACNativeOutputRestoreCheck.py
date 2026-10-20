@@ -101,7 +101,8 @@ final class IOBluetoothDevice {
 }
 struct OutputError: LocalizedError {
     let message: String
-    init(_ message: String, userFacing: String? = nil) { self.message = userFacing ?? message }
+    let diagnosticDescription: String
+    init(_ message: String, userFacing: String? = nil) { self.message = userFacing ?? message; diagnosticDescription = message }
     var errorDescription: String? { message }
 }
 
@@ -211,6 +212,9 @@ __VOLUME__
 
 @MainActor
 final class LDACNativeOutput {
+    static func diagnosticDescription(_ error: Error) -> String {
+        (error as? OutputError)?.diagnosticDescription ?? error.localizedDescription
+    }
     static var routeOwner: FileHandle?
     var holdsRouteOwner = false
     var restoringOwner = false

@@ -64,11 +64,13 @@ final class SonyProtocolTests: XCTestCase {
         let encoded = SonyFrameCodec.encode(type: 0x01, sequence: 1, payload: [])
         for split in 1..<encoded.count {
             var stream = SonyFrameStream()
-            XCTAssertTrue(stream.append(encoded.prefix(split), transmissionID: old).isEmpty)
-            let received = stream.append(encoded.dropFirst(split) + encoded, transmissionID: new)
+            XCTAssertTrue(stream.append(encoded.prefix(split), transmissionID: old, transmissionOrdinal: 1).isEmpty)
+            let received = stream.append(encoded.dropFirst(split) + encoded, transmissionID: new, transmissionOrdinal: 2)
             XCTAssertEqual(received.count, 2)
             XCTAssertEqual(received.first?.transmissionID, old)
             XCTAssertEqual(received.last?.transmissionID, new)
+            XCTAssertEqual(received.first?.transmissionOrdinal, 1)
+            XCTAssertEqual(received.last?.transmissionOrdinal, 2)
         }
         var stream = SonyFrameStream()
         XCTAssertTrue(stream.append(encoded.prefix(4), transmissionID: nil).isEmpty)
@@ -1340,12 +1342,12 @@ final class SonyInitialHandshakeTests: XCTestCase {
     }
 
     @MainActor
-    func testAllSingleByteCommandsAndUnknownFrameTypesCannotCompleteInitialHandshake() {
+    func testAllSingleByteCommandsAndUnhandledFrameTypesCannotCompleteInitialHandshake() {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         defer { controller.simulateControlLoss() }
         controller.simulateProtocolData(Data(), beginConnection: true)
         let pending = controller.simulatedPendingFrame
-        for type: UInt8 in [0x0C, 0x0E] {
+        for type: UInt8 in [0x0C, 0x0E, 0x1C, 0x1E, 0x2C] {
             for command in UInt8.min...UInt8.max {
                 controller.simulateProtocolData(SonyFrameCodec.encode(type: type, sequence: command % 2, payload: [command]))
                 XCTAssertEqual(controller.linkState, .handshaking, "Table \(type), command \(command)")
@@ -1354,11 +1356,15 @@ final class SonyInitialHandshakeTests: XCTestCase {
             }
         }
         let transmitted = controller.simulatedTransmittedFrames.count
-        for type in UInt8.min...UInt8.max where ![0x01, 0x0C, 0x0E].contains(type) {
+        var acknowledgments = 0
+        for type in UInt8.min...UInt8.max where ![0x01, 0x0C, 0x0E, 0x1C, 0x1E, 0x2C].contains(type) {
             controller.simulateProtocolData(SonyFrameCodec.encode(type: type, sequence: type % 2,
                 payload: [0x01, 0, 3, 0, 0x30, 0x18, 0, 0]))
+            if ![0x10, 0x12, 0x19, 0x1A, 0x1D].contains(type) { acknowledgments += 1 }
+            XCTAssertNil(controller.protocolInformation)
+            XCTAssertEqual(controller.linkState, .handshaking)
         }
-        XCTAssertEqual(controller.simulatedTransmittedFrames.count, transmitted)
+        XCTAssertEqual(controller.simulatedTransmittedFrames.count, transmitted + acknowledgments)
         XCTAssertEqual(controller.simulatedPendingFrame, pending)
         XCTAssertTrue(controller.simulatedHandshakeTimeoutPending)
     }
@@ -1519,12 +1525,12 @@ final class SonyInitialHandshakeTests: XCTestCase {
     }
 
     @MainActor
-    func testFirstAutomaticBLEFallbackHasFiniteAttemptsAndConnectionWait() {
+    func testFirstAutomaticBLEFallbackRemainsEligibleWithoutIndefiniteConnectionWait() {
         for attempt in 0...3 {
             let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
             defer { controller.simulateControlLoss() }
-            XCTAssertEqual(controller.simulateBLEReconnectWait(automatic: true, priorBluetoothLE: false,
-                classicConnected: true, retryAttempt: attempt), attempt < 2)
+            XCTAssertTrue(controller.simulateBLEReconnectWait(automatic: true, priorBluetoothLE: false,
+                classicConnected: true, retryAttempt: attempt))
             XCTAssertFalse(controller.simulatedBLEWaitsForConnection)
         }
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
@@ -2235,7 +2241,7 @@ final class SonyReceiveSequenceTests: XCTestCase {
         let first = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x49, 1, 1])
         let duplicate = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x49, 1, 2])
         controller.simulateProtocolData(first + duplicate)
-        XCTAssertEqual(controller.legacySurround.presetID, 0)
+        XCTAssertEqual(controller.legacySurround.presetID, 1)
         XCTAssertTrue(acknowledgments(controller).isEmpty)
         controller.completeSimulatedWrite()
         XCTAssertEqual(controller.legacySurround.presetID, 1)
@@ -2253,13 +2259,68 @@ final class SonyReceiveSequenceTests: XCTestCase {
         var badChecksum = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0x25, 0, 60, 0])
         badChecksum[badChecksum.count - 2] ^= 1
         let badSequence = SonyFrameCodec.encode(type: 0x0C, sequence: 255, payload: [0x25, 0, 60, 0])
-        let unknownType = SonyFrameCodec.encode(type: 0x0D, sequence: 1, payload: [0x25, 0, 60, 0])
-        controller.simulateProtocolData(badSequence + badChecksum + unknownType)
+        var badLength = SonyFrameCodec.encode(type: 0x2C, sequence: 1, payload: [0x25, 0, 70, 0])
+        badLength[6] += 1
+        badLength[badLength.count - 2] &+= 1
+        var badShotChecksum = SonyFrameCodec.encode(type: 0x1C, sequence: 1, payload: [0x25, 0, 70, 0])
+        badShotChecksum[badShotChecksum.count - 2] ^= 1
+        controller.simulateProtocolData(badSequence + badChecksum + badLength + badShotChecksum)
         XCTAssertEqual(controller.batteryLevel, 50)
         XCTAssertEqual(acknowledgments(controller), [1])
         controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0x25, 0, 60, 0]))
         XCTAssertEqual(controller.batteryLevel, 60)
         XCTAssertEqual(acknowledgments(controller), [1, 0])
+    }
+
+    @MainActor
+    func testUnhandledEnvelopesShareReceiveSequenceAndUseTheirAcknowledgmentPolicy() {
+        for type: UInt8 in [0x00, 0x02, 0x07, 0x09, 0x0A, 0x0D, 0x27, 0x2D, 0xFF, 0x10, 0x12, 0x19, 0x1A, 0x1D] {
+            let controller = makeController()
+            defer { controller.simulateControlLoss() }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x25, 0, 50, 0]))
+            let unsupported = SonyFrameCodec.encode(type: type, sequence: 1, payload: [0x25, 0, 99, 0])
+            controller.simulateProtocolData(unsupported + unsupported)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0x25, 0, 70, 0]))
+            XCTAssertEqual(controller.batteryLevel, 50, "Type \(type)")
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x25, 0, 70, 0]))
+            XCTAssertEqual(controller.batteryLevel, 70, "Type \(type)")
+            let shot = [0x10, 0x12, 0x19, 0x1A, 0x1D].contains(type)
+            XCTAssertEqual(acknowledgments(controller), shot ? [1, 0, 1] : [1, 0, 0, 0, 1], "Type \(type)")
+        }
+    }
+
+    @MainActor
+    func testShotAndLargeMDRRouteToTheirTablesWithoutDispatchingDuplicates() {
+        let controller = makeController()
+        defer { controller.simulateControlLoss() }
+        var batteryUpdates = 0
+        var voiceUpdates = 0
+        let batteryObservation = controller.$batteries.dropFirst().sink { _ in batteryUpdates += 1 }
+        let voiceObservation = controller.$voiceGuidance.dropFirst().sink { _ in voiceUpdates += 1 }
+        defer { batteryObservation.cancel(); voiceObservation.cancel() }
+        let first = SonyFrameCodec.encode(type: 0x1C, sequence: 0, payload: [0x25, 0, 50, 0])
+        let second = SonyFrameCodec.encode(type: 0x1E, sequence: 1, payload: [0x45, 1, 0, 1])
+        let third = SonyFrameCodec.encode(type: 0x2C, sequence: 0, payload: [0x25, 0, 70, 0])
+        controller.simulateProtocolData(first + first + second + second + third + third)
+        XCTAssertEqual(controller.batteryLevel, 70)
+        XCTAssertEqual(controller.voiceGuidance.available, false)
+        XCTAssertEqual(batteryUpdates, 2)
+        XCTAssertEqual(voiceUpdates, 1)
+        XCTAssertEqual(acknowledgments(controller), [1, 1])
+    }
+
+    @MainActor
+    func testEveryTable1MDREnvelopeCanDeliverProtocolInformation() {
+        for type: UInt8 in [0x0C, 0x1C, 0x2C] {
+            let controller = makeController()
+            defer { controller.simulateControlLoss() }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x25, 0, 50, 0]))
+            controller.simulateSameTransportHandshake()
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: type, sequence: 0,
+                payload: [0x01, 0, 3, 0, 0x30, 0x18, 0, 1]))
+            XCTAssertEqual(controller.protocolInformation?.generation, .v2, "Type \(type)")
+            XCTAssertEqual(acknowledgments(controller), type == 0x1C ? [1] : [1, 1])
+        }
     }
 
     @MainActor
@@ -2389,8 +2450,9 @@ final class SonyControlFaultSequenceTests: XCTestCase {
                     expectedACKs = 1
                 case 4:
                     let type: UInt8 = [0, 2, 0x0D, 0xFF][random.next(4)]
-                    controller.simulateProtocolData(SonyFrameCodec.encode(type: type, sequence: sequence,
-                        payload: batteryPayload(level: 99, model: model, profile: profile)))
+                    previous = send(batteryPayload(level: 99, model: model, profile: profile), type: type,
+                        sequence: &sequence, to: controller)
+                    expectedACKs = 1
                 case 5:
                     previous = send(batteryPayload(level: 99, model: model, profile: profile), type: 0x0E,
                         sequence: &sequence, to: controller)

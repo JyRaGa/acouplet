@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <IOBluetooth/IOBluetooth.h>
+#import <objc/runtime.h>
 #include "../SonyClassicConnection.h"
 #include "LDACParentLifetime.h"
 #include <errno.h>
@@ -8,6 +9,7 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <math.h>
 #include <pthread/qos.h>
 #include <poll.h>
@@ -25,14 +27,24 @@
 #endif
 
 @interface CBClassicPeer : CBPeer
+@property(readonly) NSInteger internalState;
+@property(readonly) id manager;
 @property(copy) void (^connectL2CAPCallback)(CBL2CAPChannel *, NSInteger);
 @property(copy) void (^disconnectL2CAPCallback)(CBL2CAPChannel *, NSInteger);
+- (id)sendInternalSyncMsg:(int)message args:(NSDictionary *)arguments;
+- (void)handleGetPeerState:(NSDictionary *)reply;
 - (void)openL2CAPChannel:(UInt16)psm;
 - (void)closeL2CAPChannel:(UInt16)psm;
 @end
 
-@interface IOBluetoothDevice (ClassicPeerAccess)
-@property(readonly) CBClassicPeer *classicPeer;
+@interface CBClassicManager : CBManager
+@property(readonly) BOOL tccApproved;
+@property(readonly) BOOL tccComplete;
+@property(readonly) BOOL tccRequired;
+- (instancetype)initWithQueue:(dispatch_queue_t)queue options:(NSDictionary *)options;
+- (void)checkForTCC;
+- (CBClassicPeer *)retrievePeerWithAddress:(NSString *)address;
+- (CBClassicPeer *)peerWithIdentifier:(NSUUID *)identifier;
 @end
 
 @interface CBL2CAPChannel (ChannelInspection)
@@ -47,6 +59,27 @@ static void RunLoopFor(NSTimeInterval seconds) {
 
 static double MonotonicTime(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000000000.0;
+}
+
+static const char *RefreshOwnedPeer(CBClassicPeer *peer, CBClassicManager *manager) {
+    if (peer.manager != manager || [manager peerWithIdentifier:peer.identifier] != peer) return "owned-peer-refresh-owner-mismatch";
+    NSInteger before = peer.internalState;
+    uint64_t began = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    id reply = [peer sendInternalSyncMsg:0x2f args:nil];
+    uint64_t elapsed = clock_gettime_nsec_np(CLOCK_MONOTONIC) - began;
+    if (![reply isKindOfClass:NSDictionary.class]) return "owned-peer-refresh-invalid-reply";
+    id state = reply[@"kCBMsgArgState"];
+    if (![state isKindOfClass:NSDictionary.class]) return "owned-peer-refresh-invalid-reply";
+    id number = state[@"kCBMsgArgInternalState"];
+    if (![number isKindOfClass:NSNumber.class]) return "owned-peer-refresh-invalid-reply";
+    if (![number isEqualToNumber:@2]) return "owned-peer-refresh-not-connected";
+    if (peer.manager != manager || [manager peerWithIdentifier:peer.identifier] != peer) return "owned-peer-refresh-owner-mismatch";
+    [peer handleGetPeerState:reply];
+    BOOL owned = peer.manager == manager && [manager peerWithIdentifier:peer.identifier] == peer;
+    printf("OWNED_PEER_REFRESH query_state=2 before_state=%ld after_state=%ld query_ns=%" PRIu64 " owned_match=%d\n",
+           (long)before, (long)peer.internalState, elapsed, owned);
+    if (!owned) return "owned-peer-refresh-owner-mismatch";
+    return peer.internalState == 2 ? NULL : "owned-peer-refresh-update-failed";
 }
 
 enum { SenderOther, SenderControl, SenderInput, SenderPCM, SenderEncode, SenderPacing, SenderStageCount };
@@ -80,6 +113,64 @@ static SenderTiming NewSenderTiming(void) {
 static BOOL ReadOption(int fd, int option, int *value) {
     socklen_t length = sizeof(*value);
     return getsockopt(fd, SOL_SOCKET, option, value, &length) == 0;
+}
+
+typedef struct {
+    int value;
+    int error;
+    double at;
+    double duration;
+} SocketObservation;
+
+static SocketObservation ObserveSocketOption(int fd, int option) {
+    int savedError = errno;
+    SocketObservation observation = {.value = -1};
+    double began = MonotonicTime();
+    if (!ReadOption(fd, option, &observation.value)) {
+        observation.error = errno;
+        observation.value = -1;
+    }
+    observation.at = MonotonicTime();
+    observation.duration = observation.at - began;
+    errno = savedError;
+    return observation;
+}
+
+static void RecordDrainQueue(int fd, const char *stage, NSUInteger packet, double started,
+                             NSUInteger bufferedFrames, NSUInteger polls, double maximumGap,
+                             double maximumPollDuration) {
+    SocketObservation pending = ObserveSocketOption(fd, SO_NWRITE);
+    printf("DRAIN_QUEUE stage=%s packet=%lu pending=%d pendingErr=%d observed=%.6f queryDuration=%.6f bufferedFrames=%lu polls=%lu maxGap=%.6f maxPollDuration=%.6f\n",
+           stage, packet, pending.value, pending.error, pending.at - started, pending.duration,
+           bufferedFrames, polls, maximumGap, maximumPollDuration);
+}
+
+static BOOL SocketObservationChecks(void) {
+    errno = EDOM;
+    SocketObservation invalid = ObserveSocketOption(-1, SO_NWRITE);
+    BOOL passed = invalid.value == -1 && invalid.error == EBADF && errno == EDOM &&
+        invalid.at > 0 && invalid.duration >= 0;
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return NO;
+    SocketObservation buffer = ObserveSocketOption(sockets[0], SO_SNDBUF);
+    SocketObservation lowWater = ObserveSocketOption(sockets[0], SO_SNDLOWAT);
+    SocketObservation pending = ObserveSocketOption(sockets[0], SO_NWRITE);
+    passed &= !buffer.error && buffer.value > 0 && !lowWater.error && lowWater.value > 0 &&
+        !pending.error && pending.value == 0;
+    uint8_t sent[] = {1, 2, 3, 4}, received[sizeof(sent)] = {0};
+    ssize_t written = send(sockets[0], sent, sizeof(sent), MSG_DONTWAIT);
+    pending = ObserveSocketOption(sockets[0], SO_NWRITE);
+    passed &= written == sizeof(sent) && !pending.error && pending.value >= 0;
+    passed &= recv(sockets[1], received, sizeof(received), MSG_DONTWAIT) == sizeof(received) &&
+        !memcmp(sent, received, sizeof(sent));
+    pending = ObserveSocketOption(sockets[0], SO_NWRITE);
+    SocketObservation finalBuffer = ObserveSocketOption(sockets[0], SO_SNDBUF);
+    SocketObservation finalLowWater = ObserveSocketOption(sockets[0], SO_SNDLOWAT);
+    passed &= !pending.error && pending.value == 0 && !finalBuffer.error && !finalLowWater.error &&
+        buffer.value == finalBuffer.value && lowWater.value == finalLowWater.value;
+    close(sockets[0]); close(sockets[1]);
+    printf("SOCKET_OBSERVATION_CHECK result=%s hardwareAccess=0\n", passed ? "PASS" : "FAIL");
+    return passed;
 }
 
 static BOOL ParseUnsigned(NSString *text, uint32_t *value) {
@@ -500,13 +591,15 @@ static BOOL SelfTest(void) {
         ParseDurationSeconds(@"60", &seconds) == ACOUPLET_LDAC_PROBE_ONLY;
     passed &= ParseGain(@"0", &gain) && gain == 0 && !ParseGain(@"nan", &gain) && !ParseGain(@"1.01", &gain);
     passed &= [NormalizeAddress("02:00:00:00:00:ab") isEqualToString:@"02-00-00-00-00-AB"] && !NormalizeAddress("02-00-00-00-00-G6");
-    return MatrixChecks() && passed;
+    return SocketObservationChecks() && MatrixChecks() && passed;
 }
 
 @interface DirectMediaProbe : NSObject
 @property BOOL closed;
 @property BOOL failed;
 @property BOOL openFailed;
+@property BOOL openDone;
+@property NSInteger openError;
 @property BOOL inputEnded;
 @property NSUInteger received;
 @property UInt16 realCID;
@@ -657,6 +750,39 @@ static BOOL SelfTest(void) {
     }
 }
 @end
+
+static void RecordOwnedOpen(DirectMediaProbe *probe, CBL2CAPChannel *value, NSInteger error) {
+    printf("OPEN_CALLBACK time=%.6f status=0x%08X channel=%p PSM=%04X CID=%04X\n",
+           NSDate.date.timeIntervalSince1970, (unsigned int)error, (__bridge void *)value, value.PSM, value.cid);
+    if (probe.openDone || (value && value.PSM != 0x0019)) {
+        probe.failed = YES;
+        probe.openError = -1;
+        probe.openDone = YES;
+        return;
+    }
+    probe.channel = value;
+    probe.realCID = value.cid;
+    probe.openError = error;
+    probe.openDone = YES;
+    probe.openFailed = error && !value;
+    if (error || !value || !value.cid || value.outgoingMTU <= 13) {
+        probe.failed = YES;
+        if (!value && !error) printf("OPEN_INDETERMINATE reason=nil-channel-zero-status\n");
+        return;
+    }
+    printf("OWNED_OPEN CID=%04X outgoingMTU=%u\n", value.cid, value.outgoingMTU);
+}
+
+static void RecordOwnedClose(DirectMediaProbe *probe, CBL2CAPChannel *value, NSInteger error) {
+    BOOL matched = value && value == probe.channel && value.PSM == 0x0019 && probe.realCID && value.cid == probe.realCID;
+    printf("CLOSED_CALLBACK time=%.6f channel=%p PSM=%04X CID=%04X status=0x%08X ownedMatch=%d\n",
+           NSDate.date.timeIntervalSince1970, (__bridge void *)value, value.PSM, value.cid, (unsigned int)error, matched);
+    if (!matched || error) probe.failed = YES;
+    if (matched && !probe.closed) {
+        probe.closed = YES;
+        printf("OWNED_CLOSED CID=%04X\n", probe.realCID);
+    }
+}
 
 static BOOL ContinuousPCMChecks(void) {
     LDACProfile profile;
@@ -824,6 +950,45 @@ static NSString *ReadCommand(DirectMediaProbe *probe) {
     }
 }
 
+static BOOL CloseOwnedChannel(DirectMediaProbe *probe, CBClassicPeer *peer, double seconds) {
+    probe.pcmComplete = YES;
+    if (probe.openDone && probe.openFailed && !probe.channel) {
+        printf("OPEN_FAILED_TERMINAL no established channel to close\n");
+        return YES;
+    }
+    double deadline = MonotonicTime() + seconds;
+    CBL2CAPChannel *requestedChannel = probe.channel;
+    if (!probe.closed) {
+        printf("CLOSE_BEGIN time=%.6f CID=%04X openPending=%d\n", NSDate.date.timeIntervalSince1970, probe.realCID, !probe.openDone);
+        [peer closeL2CAPChannel:0x0019];
+        printf("CLOSE_RETURN time=%.6f requested=1\n", NSDate.date.timeIntervalSince1970);
+    }
+    while (!probe.closed && MonotonicTime() < deadline) {
+        if (probe.openDone && probe.openFailed && !probe.channel) {
+            printf("OPEN_FAILED_TERMINAL no established channel to close\n");
+            return YES;
+        }
+        if (probe.channel && probe.channel != requestedChannel) {
+            requestedChannel = probe.channel;
+            printf("CLOSE_LATE_OPEN CID=%04X\n", probe.realCID);
+            [peer closeL2CAPChannel:0x0019];
+        }
+        NSString *command = AvailableCommand(probe);
+        if (command && ![command isEqualToString:@"close"] && ![command isEqualToString:@"stop"]) {
+            printf("COMMAND_REJECTED phase=close command=%s\n", command.UTF8String);
+            probe.failed = YES;
+        }
+        [probe pollInput];
+        [probe pollPCM];
+        if (!probe.closed) RunLoopFor(0.001);
+    }
+    if (!probe.closed) {
+        printf("OWNED_CLOSE_UNCONFIRMED CID=%04X openPending=%d openIndeterminate=%d inputEOF=%d parentEOF=%d closeRequested=1\n",
+               probe.realCID, !probe.openDone, probe.openDone && !probe.channel && !probe.openFailed, probe.inputEnded, probe.stdinEnded);
+    }
+    return probe.closed;
+}
+
 static BOOL PreparedPCMStopChecks(void) {
     LDACProfile profile;
     if (!SelectProfile(96000, @"high", &profile)) return NO;
@@ -959,6 +1124,14 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         lowWaterChanged = YES;
         printf("SOCKET fd=%d CID=%04X outgoingMTU=%u type=%d baseline=%d\n",
                fd, owned.cid, owned.outgoingMTU, socketType, baseline);
+        struct sockaddr_storage socketAddress = {0};
+        socklen_t socketAddressLength = sizeof(socketAddress);
+        int familyError = getsockname(fd, (struct sockaddr *)&socketAddress, &socketAddressLength) == 0 ? 0 : errno;
+        SocketObservation sendBuffer = ObserveSocketOption(fd, SO_SNDBUF);
+        SocketObservation lowWater = ObserveSocketOption(fd, SO_SNDLOWAT);
+        printf("SOCKET_DIAGNOSTICS fd=%d family=%d familyErr=%d type=%d sendBuffer=%d sendBufferErr=%d originalLowWater=%d lowWater=%d lowWaterErr=%d\n",
+               fd, familyError ? -1 : socketAddress.ss_family, familyError, socketType,
+               sendBuffer.value, sendBuffer.error, originalLowWater, lowWater.value, lowWater.error);
         started = MonotonicTime();
         probe.degradation = (DegradationState){.windowEnd = started + 1};
         double deadline = continuous ? INFINITY : started + seconds + 1;
@@ -1161,9 +1334,13 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             double beforeSend = MonotonicTime();
             ssize_t sent = send(fd, packet, packetLength, 0);
             double afterSend = MonotonicTime();
-            if (!continuous || sent != (ssize_t)packetLength) printf("SEND packet=%lu CID=%04X bytes=%zd expected=%lu elapsed=%.6f duration=%.6f late=%.6f errno=%d\n",
+            int sendError = sent < 0 ? errno : 0;
+            if (!continuous || sent != (ssize_t)packetLength) {
+                SocketObservation pending = ObserveSocketOption(fd, SO_NWRITE);
+                printf("SEND packet=%lu CID=%04X bytes=%zd expected=%lu elapsed=%.6f duration=%.6f late=%.6f errno=%d pending=%d pendingErr=%d observed=%.6f queryDuration=%.6f\n",
                    sentPackets, owned.cid, sent, packetLength, afterSend - started, afterSend - beforeSend, lateness,
-                   sent < 0 ? errno : 0);
+                   sendError, pending.value, pending.error, pending.at - started, pending.duration);
+            }
             if (sent != (ssize_t)packetLength) break;
             sentPackets++;
             sentBytes += (NSUInteger)sent;
@@ -1173,6 +1350,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             BOOL drainBreached = NO;
             double lastDrainObservation = afterSend;
             double maximumSchedulerGap = 0;
+            double maximumPollDuration = 0;
+            NSUInteger drainPolls = 0;
             while (!probe.closed && !probe.failed && !probe.inputEnded && owned.socketFD == fd) {
                 if (continuous && !probe.stopRequested && !finishing && [probe checkDegradation]) break;
                 double pollAt = MonotonicTime();
@@ -1182,6 +1361,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 int count = kevent(queue, NULL, 0, &event, 1, &immediate);
                 int pollError = count < 0 ? errno : 0;
                 now = MonotonicTime();
+                drainPolls++;
+                maximumPollDuration = fmax(maximumPollDuration, now - pollAt);
                 lastDrainObservation = now;
                 double drainDuration = now - afterSend;
                 if (drainDuration >= 0.1 && !drainBreached) {
@@ -1191,6 +1372,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                            sentPackets - 1, now - started, drainDuration, first, lastPollAt - started, pollAt - lastPollAt,
                            now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
                            count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError);
+                    RecordDrainQueue(fd, "breach", sentPackets - 1, started, probe.pcmBytes / 8,
+                                     drainPolls, maximumSchedulerGap, maximumPollDuration);
                 }
                 lastPollAt = now;
                 lastPollCount = count;
@@ -1202,9 +1385,9 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     break;
                 }
                 if (count) {
-                    if (!continuous) printf("DRAIN packet=%lu writable=%ld baseline=%d elapsed=%.6f duration=%.6f flags=%04X wakeGap=%.6f\n",
+                    if (!continuous) printf("DRAIN packet=%lu writable=%ld baseline=%d elapsed=%.6f duration=%.6f flags=%04X wakeGap=%.6f polls=%lu maxGap=%.6f maxPollDuration=%.6f\n",
                            sentPackets - 1, (long)event.data, baseline, now - started, drainDuration, event.flags,
-                           wakeGap);
+                           wakeGap, drainPolls, maximumSchedulerGap, maximumPollDuration);
                     if (event.data == baseline) drained = YES;
                 }
                 double drainLimit = continuous ? (double)profile.capacityBytes / (profile.sampleRate * 8) : 0.25;
@@ -1213,6 +1396,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     printf("DRAIN_LIMIT packet=%lu elapsed=%.6f duration=%.6f limit=%.3f lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f count=%d flags=%04X data=%ld\n",
                            sentPackets - 1, now - started, drainDuration, drainLimit, previousPollAt - started, wakeGap, now - pollAt,
                            lastPollCount, lastPollFlags, lastPollData);
+                    RecordDrainQueue(fd, "limit", sentPackets - 1, started, probe.pcmBytes / 8,
+                                     drainPolls, maximumSchedulerGap, maximumPollDuration);
                     break;
                 }
                 if (count) break;
@@ -1274,6 +1459,21 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             [probe pollPCM];
             RunLoopFor(0.001);
         }
+        if (!probe.closed && owned.socketFD == fd) {
+            struct kevent event;
+            struct timespec immediate = {0, 0};
+            double pollAt = MonotonicTime();
+            int count = kevent(queue, NULL, 0, &event, 1, &immediate);
+            int pollError = count < 0 ? errno : 0;
+            double polledAt = MonotonicTime();
+            SocketObservation pending = ObserveSocketOption(fd, SO_NWRITE);
+            printf("POSTROLL_QUEUE pending=%d pendingErr=%d observed=%.6f queryDuration=%.6f pollAt=%.6f pollDuration=%.6f count=%d flags=%04X data=%ld pollErr=%d bufferedFrames=%lu\n",
+                   pending.value, pending.error, pending.at - started, pending.duration,
+                   pollAt - started, polledAt - pollAt, count, count > 0 ? event.flags : 0,
+                   count > 0 ? (long)event.data : 0, pollError, probe.pcmBytes / 8);
+        } else {
+            printf("POSTROLL_QUEUE unavailable=1 reason=owned-socket-closed elapsed=%.6f\n", MonotonicTime() - started);
+        }
     }
     if (!probe.closed && owned.socketFD == fd) {
         if (lowWaterChanged && setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &originalLowWater, sizeof(originalLowWater)) != 0)
@@ -1331,9 +1531,9 @@ int main(int argc, const char *argv[]) {
         argumentsValid = argumentsValid && pcmSeen && addressSeen && SelectProfile(sampleRate, quality, &profile);
         if (!argumentsValid) {
 #if ACOUPLET_LDAC_PROBE_ONLY
-            fprintf(stderr, "Usage: %s --media --pcm-fd FD --address ADDRESS [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high]; stdin: open, start live GAIN SECONDS (0=continuous, 1..60), gain VALUE, stop, close, transport-closed\n"
+            fprintf(stderr, "Usage: %s --media --pcm-fd FD --address ADDRESS [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high]; stdin: open, start live GAIN SECONDS (0=continuous, 1..60), gain VALUE, stop, close\n"
 #else
-            fprintf(stderr, "Usage: %s --media --pcm-fd FD --address ADDRESS [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high]; stdin: open, start live GAIN 0, gain VALUE, stop, close, transport-closed\n"
+            fprintf(stderr, "Usage: %s --media --pcm-fd FD --address ADDRESS [--sample-rate 44100|48000|88200|96000] [--quality auto|low|mid|high]; stdin: open, start live GAIN 0, gain VALUE, stop, close\n"
 #endif
                     "       %s --self-test\n", argv[0], argv[0]);
             return 2;
@@ -1354,12 +1554,47 @@ int main(int argc, const char *argv[]) {
             fprintf(stderr, "The exact Sony target must already be paired and connected; launch only after signaling Open acceptance\n");
             return 3;
         }
-        CBClassicPeer *peer __attribute__((objc_precise_lifetime)) = device.classicPeer;
-        if (!peer) {
-            printf("NO_OPEN coordinator returned no Classic peer\n");
+        Class managerClass = NSClassFromString(@"CBClassicManager");
+        if (![managerClass instancesRespondToSelector:@selector(initWithQueue:options:)] ||
+            ![managerClass instancesRespondToSelector:@selector(tccApproved)] ||
+            ![managerClass instancesRespondToSelector:@selector(tccComplete)] ||
+            ![managerClass instancesRespondToSelector:@selector(tccRequired)] ||
+            ![managerClass instancesRespondToSelector:@selector(checkForTCC)] ||
+            ![managerClass instancesRespondToSelector:@selector(peerWithIdentifier:)] ||
+            ![managerClass instancesRespondToSelector:@selector(retrievePeerWithAddress:)]) {
+            printf("NO_OPEN Classic manager interface is unavailable reason=classic-manager-unavailable\n");
             return 4;
         }
-        printf("TARGET owner=IOBluetoothCoordinator address=%s UUID=%s\n", device.addressString.UTF8String,
+        CBClassicManager *manager __attribute__((objc_precise_lifetime)) =
+            [[managerClass alloc] initWithQueue:dispatch_get_main_queue() options:nil];
+        double managerDeadline = MonotonicTime() + 5;
+        BOOL authorizationRequested = NO;
+        while (manager && !manager.tccApproved && MonotonicTime() < managerDeadline) {
+            if (manager.state == CBManagerStatePoweredOn && !manager.tccRequired && !manager.tccComplete && !authorizationRequested) {
+                authorizationRequested = YES;
+                [manager checkForTCC];
+            }
+            RunLoopFor(0.01);
+        }
+        if (!manager.tccApproved) {
+            printf("NO_OPEN Classic manager %s\n", manager.tccComplete ? "authorization was not granted reason=classic-authorization-denied" : "initialization did not complete reason=classic-initialization-incomplete");
+            return 4;
+        }
+        CBClassicPeer *peer __attribute__((objc_precise_lifetime)) =
+            [manager retrievePeerWithAddress:[device.addressString stringByReplacingOccurrencesOfString:@"-" withString:@":"]];
+        if (!peer) {
+            printf("NO_OPEN owned Classic manager returned no target peer reason=classic-target-unavailable\n");
+            return 4;
+        }
+        Method refreshQuery = class_getInstanceMethod(peer.class, @selector(sendInternalSyncMsg:args:));
+        Method refreshHandler = class_getInstanceMethod(peer.class, @selector(handleGetPeerState:));
+        if (![peer respondsToSelector:@selector(manager)] || ![peer respondsToSelector:@selector(internalState)] ||
+            !refreshQuery || strcmp(method_getTypeEncoding(refreshQuery), "@28@0:8i16@20") ||
+            !refreshHandler || strcmp(method_getTypeEncoding(refreshHandler), "v24@0:8@16")) {
+            printf("NO_OPEN reason=unexpected-peer-refresh-interface\n");
+            return 4;
+        }
+        printf("TARGET owner=CBClassicManager address=%s UUID=%s\n", device.addressString.UTF8String,
                peer.identifier.UUIDString.UTF8String);
         DirectMediaProbe *probe __attribute__((objc_precise_lifetime)) = [DirectMediaProbe new];
         probe.profile = profile;
@@ -1371,64 +1606,42 @@ int main(int argc, const char *argv[]) {
         NSString *opening = ReadCommand(probe);
         if ([opening isEqualToString:@"close"]) return 0;
         if (![opening isEqualToString:@"open"]) return 4;
-        __block BOOL openDone = NO;
-        __block NSInteger openError = 0;
         peer.connectL2CAPCallback = ^(CBL2CAPChannel *value, NSInteger error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                printf("OPEN_CALLBACK time=%.6f status=0x%08X channel=%p PSM=%04X CID=%04X\n",
-                       NSDate.date.timeIntervalSince1970, (unsigned int)error, (__bridge void *)value, value.PSM, value.cid);
-                if (openDone || (value && value.PSM != 0x0019)) {
-                    probe.failed = YES;
-                    openError = -1;
-                    openDone = YES;
-                    return;
-                }
-                probe.channel = value;
-                probe.realCID = value.cid;
-                openError = error;
-                openDone = YES;
-                if (error) { probe.failed = YES; probe.openFailed = YES; }
+                RecordOwnedOpen(probe, value, error);
             });
         };
         peer.disconnectL2CAPCallback = ^(CBL2CAPChannel *value, NSInteger error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                printf("CLOSED_CALLBACK time=%.6f channel=%p PSM=%04X CID=%04X status=0x%08X\n",
-                       NSDate.date.timeIntervalSince1970, (__bridge void *)value, value.PSM, value.cid, (unsigned int)error);
-                if (probe.channel && value && value.PSM == 0x0019 && value.cid == probe.realCID)
-                    probe.closed = YES;
+                RecordOwnedClose(probe, value, error);
             });
         };
+        const char *refreshFailure = RefreshOwnedPeer(peer, manager);
+        if (refreshFailure) {
+            printf("NO_OPEN reason=%s\n", refreshFailure);
+            peer.connectL2CAPCallback = nil;
+            peer.disconnectL2CAPCallback = nil;
+            return 4;
+        }
         printf("OPEN_BEGIN time=%.6f PSM=0019 role=media\n", NSDate.date.timeIntervalSince1970);
         [peer openL2CAPChannel:0x0019];
         double openDeadline = MonotonicTime() + 5;
-        while (!openDone && !probe.stdinEnded && !probe.closeRequested && MonotonicTime() < openDeadline) {
+        while (!probe.openDone && !probe.stdinEnded && !probe.closeRequested && !probe.failed && MonotonicTime() < openDeadline) {
             NSString *command = AvailableCommand(probe);
             if ([command isEqualToString:@"close"] || [command isEqualToString:@"stop"]) probe.closeRequested = YES;
             else if (command) { printf("COMMAND_REJECTED phase=open\n"); probe.failed = YES; }
             RunLoopFor(0.001);
         }
-        BOOL openExpired = !openDone;
+        BOOL openExpired = !probe.openDone;
         if (openExpired) {
-            printf("OPEN_DEADLINE no sends; retaining owner until terminal open callback\n");
-            while (!openDone && !probe.stdinEnded && !probe.closeRequested) {
-                NSString *command = AvailableCommand(probe);
-                if ([command isEqualToString:@"close"] || [command isEqualToString:@"stop"]) probe.closeRequested = YES;
-                else if (command) { printf("COMMAND_REJECTED phase=open\n"); probe.failed = YES; }
-                RunLoopFor(0.001);
-            }
-            if (!openDone) {
-                printf("PENDING_CLOSE_REQUESTED parentEOF=%d\n", probe.stdinEnded);
-                [peer closeL2CAPChannel:0x0019];
-                double deadline = MonotonicTime() + 2;
-                while (!openDone && MonotonicTime() < deadline) RunLoopFor(0.001);
-                if (!openDone) printf("OPEN_TERMINAL_UNCONFIRMED closeRequested=1\n");
-            }
+            printf("OPEN_DEADLINE no sends; requesting bounded owned close parentEOF=%d closeRequested=%d\n",
+                   probe.stdinEnded, probe.closeRequested);
         }
         CBL2CAPChannel *owned __attribute__((objc_precise_lifetime)) = probe.channel;
         printf("OPEN_RETURN time=%.6f status=0x%08X channel=%p\n",
-               NSDate.date.timeIntervalSince1970, (unsigned int)openError, (__bridge void *)owned);
+               NSDate.date.timeIntervalSince1970, (unsigned int)probe.openError, (__bridge void *)owned);
         int result = 5;
-        if (!openExpired && !openError && owned && !probe.closed && !probe.failed &&
+        if (!openExpired && !probe.openError && owned && !probe.closed && !probe.failed && !probe.closeRequested && !probe.stdinEnded &&
             owned.PSM == 0x0019 && owned.cid && owned.outgoingMTU > 13) {
             probe.input = owned.inputStream;
             probe.output = owned.outputStream;
@@ -1487,42 +1700,10 @@ int main(int argc, const char *argv[]) {
             }
         } else {
             printf("NOT_READY status=0x%08X closed=%d failed=%d CID=%04X outgoingMTU=%u socketFD=%d\n",
-                   (unsigned int)openError, probe.closed, probe.failed, owned.cid, owned.outgoingMTU, owned ? owned.socketFD : -1);
+                   (unsigned int)probe.openError, probe.closed, probe.failed, owned.cid, owned.outgoingMTU, owned ? owned.socketFD : -1);
         }
-        if (probe.openFailed || !owned) {
-            if (openDone) printf("OPEN_FAILED_TERMINAL no established channel to close\n");
-            else printf("OPEN_CLOSE_UNCONFIRMED no delivered channel; normal close requested\n");
-        } else if (!probe.closed) {
-            printf("CLOSE_BEGIN time=%.6f CID=%04X\n", NSDate.date.timeIntervalSince1970, owned.cid);
-            [peer closeL2CAPChannel:0x0019];
-            printf("CLOSE_RETURN time=%.6f requested=1\n", NSDate.date.timeIntervalSince1970);
-            printf("WAIT_TRANSPORT_CLOSED CID=%04X\n", owned.cid);
-            double closeDeadline = 0;
-            while (!probe.closed) {
-                NSString *command = AvailableCommand(probe);
-                if ([command isEqualToString:@"transport-closed"]) {
-                    probe.closed = YES;
-                    printf("TRANSPORT_CLOSED_CONFIRMED time=%.6f CID=%04X source=daemon-gate\n",
-                           NSDate.date.timeIntervalSince1970, owned.cid);
-                } else if (command) {
-                    printf("UNEXPECTED_TRANSPORT_CLOSE_CONTROL command=%s\n", command.UTF8String);
-                    result = 5;
-                }
-                [probe pollInput];
-                [probe pollPCM];
-                if (probe.stdinEnded && probe.inputEnded && !probe.closed) {
-                    probe.closed = YES;
-                    printf("TRANSPORT_CLOSED_CONFIRMED time=%.6f CID=%04X source=owned-input-eof\n", NSDate.date.timeIntervalSince1970, owned.cid);
-                }
-                if (probe.stdinEnded && !closeDeadline) closeDeadline = MonotonicTime() + 2;
-                if (closeDeadline && !probe.closed && MonotonicTime() >= closeDeadline) {
-                    printf("TRANSPORT_CLOSE_UNCONFIRMED CID=%04X parentEOF=1 closeRequested=1\n", owned.cid);
-                    result = 5;
-                    break;
-                }
-                if (!probe.closed) RunLoopFor(0.001);
-            }
-        }
+        if (!CloseOwnedChannel(probe, peer, 5)) result = 5;
+        owned = probe.channel;
         [probe.input close];
         [probe.output close];
         peer.connectL2CAPCallback = nil;

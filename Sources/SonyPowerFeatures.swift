@@ -1,3 +1,5 @@
+import Foundation
+
 struct SonyBatteryCare: Equatable, Sendable {
     let includesThreshold: Bool
     private(set) var threshold: UInt8?
@@ -110,9 +112,43 @@ struct SonyAutoPowerSave: Equatable, Sendable {
     }
 }
 
+struct SonyPowerSwitch: Equatable, Sendable {
+    let inquiryType: UInt8
+    private(set) var available: Bool?
+    private(set) var enabled: Bool?
+
+    var queryPayloads: [[UInt8]] { [[0x22, inquiryType], [0x26, inquiryType]] }
+
+    func setPayload(enabled: Bool) -> [UInt8]? {
+        guard available == true, self.enabled != nil else { return nil }
+        return [0x28, inquiryType, enabled ? 0x00 : 0x01]
+    }
+
+    mutating func invalidateRead(_ query: [UInt8]) {
+        switch query {
+        case [0x22, inquiryType]: available = nil
+        case [0x26, inquiryType]: enabled = nil
+        default: break
+        }
+    }
+
+    @discardableResult
+    mutating func update(_ payload: [UInt8], frameType: UInt8) -> Bool {
+        guard frameType == 0x0C, payload.count == 3, payload[1] == inquiryType else { return false }
+        switch payload[0] {
+        case 0x23, 0x25: available = payload[2] <= 1 ? payload[2] == 0 : nil
+        case 0x27, 0x29: enabled = payload[2] <= 1 ? payload[2] == 0 : nil
+        default: return false
+        }
+        return true
+    }
+}
+
 struct SonyPowerFeatures: Equatable, Sendable {
     private(set) var batteryCare: SonyBatteryCare?
     private(set) var autoPowerSave: SonyAutoPowerSave?
+    private(set) var touchPanelBacklight: SonyPowerSwitch?
+    private(set) var stamina: SonyPowerSwitch?
 
     init(supportedFunctions: Set<UInt8> = [], supportedFunctions2: Set<UInt8> = []) {
         updateSupportedFunctions(supportedFunctions, supportedFunctions2: supportedFunctions2)
@@ -126,21 +162,50 @@ struct SonyPowerFeatures: Equatable, Sendable {
         }
         if !supportedFunctions.contains(0x2B) { autoPowerSave = nil }
         else if autoPowerSave == nil { autoPowerSave = SonyAutoPowerSave() }
+        if !supportedFunctions.contains(0x2E) { stamina = nil }
+        else if stamina == nil { stamina = SonyPowerSwitch(inquiryType: 0x0E) }
+        if !supportedFunctions.contains(0x2F) { touchPanelBacklight = nil }
+        else if touchPanelBacklight == nil { touchPanelBacklight = SonyPowerSwitch(inquiryType: 0x0F) }
     }
 
     func queryPayloads(frameType: UInt8) -> [[UInt8]] {
         (batteryCare?.frameType == frameType ? batteryCare?.queryPayloads ?? [] : [])
             + (frameType == 0x0C ? autoPowerSave?.queryPayloads ?? [] : [])
+            + (frameType == 0x0C ? touchPanelBacklight?.queryPayloads ?? [] : [])
+            + (frameType == 0x0C ? stamina?.queryPayloads ?? [] : [])
     }
 
     mutating func invalidateRead(_ query: [UInt8], frameType: UInt8) {
         if batteryCare?.frameType == frameType { batteryCare?.invalidateRead(query) }
-        if frameType == 0x0C { autoPowerSave?.invalidateRead(query) }
+        if frameType == 0x0C {
+            autoPowerSave?.invalidateRead(query)
+            touchPanelBacklight?.invalidateRead(query)
+            stamina?.invalidateRead(query)
+        }
     }
 
     @discardableResult
     mutating func update(_ payload: [UInt8], frameType: UInt8) -> Bool {
         if batteryCare?.update(payload, frameType: frameType) == true { return true }
-        return autoPowerSave?.update(payload, frameType: frameType) == true
+        if autoPowerSave?.update(payload, frameType: frameType) == true { return true }
+        if touchPanelBacklight?.update(payload, frameType: frameType) == true { return true }
+        return stamina?.update(payload, frameType: frameType) == true
+    }
+}
+
+struct SonyStaminaChange: Equatable, Sendable {
+    let requestID: UUID
+    let session: UInt64
+    let enabled: Bool
+    private(set) var replyPayload: [UInt8]?
+
+    mutating func receiveAlert(_ alert: SonyConnectionAlert, requestID: UUID?, session: UInt64) -> [UInt8]? {
+        guard self.requestID == requestID, self.session == session, replyPayload == nil,
+              alert.format == .fixed,
+              (enabled ? [0x84, 0x85] : [0x82, 0x83]).contains(alert.messageID),
+              alert.actionType == .positiveNegative || alert.actionType == .positiveConfirmationWithReply else { return nil }
+        let payload: [UInt8] = [0x98, 0x00, alert.messageID, 0x01]
+        replyPayload = payload
+        return payload
     }
 }

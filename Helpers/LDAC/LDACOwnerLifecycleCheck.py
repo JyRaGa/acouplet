@@ -12,7 +12,7 @@ native = (root / 'Sources/LDACNativeSession.swift').read_text()
 output = (root / 'Sources/LDACNativeOutput.swift').read_text()
 types = native[native.index('struct LDACFormat:'):native.index('final class LDACNativeSession:')]
 child = native[native.index('final class LDACNativeChild {'):native.rindex('#endif')]
-events = native[native.index('    enum Event:'):native.index('    private static let daemonEventExpression')]
+events = native[native.index('    enum Event:'):native.index('    let id: UUID')]
 volume = output[output.index('struct LDACNativeVolume:'):output.index('@MainActor\nfinal class LDACNativeOutput')]
 restoration = output[output.index('    @discardableResult\n    func silence('):output.index('    private func applyControls(')]
 selectors = output[output.index('    private var handoffSelectors:'):output.index('    init(id:')]
@@ -36,7 +36,8 @@ func SwiftRecord(_ value: String) {
 
 struct OutputError: LocalizedError {
     let message: String
-    init(_ message: String, userFacing: String? = nil) { self.message = userFacing ?? message }
+    let diagnosticDescription: String
+    init(_ message: String, userFacing: String? = nil) { self.message = userFacing ?? message; diagnosticDescription = message }
     var errorDescription: String? { message }
 }
 
@@ -45,6 +46,9 @@ __VOLUME__
 
 @MainActor
 final class LDACNativeOutput {
+    static func diagnosticDescription(_ error: Error) -> String {
+        (error as? OutputError)?.diagnosticDescription ?? error.localizedDescription
+    }
     nonisolated static let uid = "dev.baglayan.Acouplet.ldac-output"
     static let system: AudioObjectID = 1
     static let defaultSelectors = [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultSystemOutputDevice]

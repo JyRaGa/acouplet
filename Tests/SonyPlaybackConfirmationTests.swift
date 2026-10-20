@@ -59,6 +59,30 @@ final class SonyPlaybackConfirmationTests: XCTestCase {
         controller.simulateControlLoss()
     }
 
+    func testNewVolumeCannotBorrowTimedOutWriteOwnership() async {
+        let controller = makeController()
+        defer { controller.simulateControlLoss() }
+        controller.setPlaybackVolume(10)
+        acknowledgeSimulatedCommands(controller)
+        controller.simulateSettingTimeout(.playbackVolume)
+        for _ in 0..<20 where controller.pendingChanges[.playbackVolume] != nil { await Task.yield() }
+        XCTAssertNil(controller.pendingChanges[.playbackVolume])
+        XCTAssertNotNil(controller.settingErrors[.playbackVolume])
+        controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0xA9, 0x20, 12]))
+        let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0xA9, 0x20, 10])
+        controller.simulateProtocolData(encoded.prefix(4))
+        controller.defersSimulatedWrites = true
+        controller.setPlaybackVolume(10)
+        controller.completeSimulatedWrite()
+        controller.simulateProtocolData(encoded.dropFirst(4))
+        controller.completeSimulatedWrite()
+        XCTAssertEqual(controller.pendingChanges[.playbackVolume], [10])
+        controller.defersSimulatedWrites = false
+        acknowledgeSimulatedCommands(controller)
+        receive([0xA9, 0x20, 10], on: controller)
+        XCTAssertNil(controller.pendingChanges[.playbackVolume])
+    }
+
     func testNewerNotificationObsoletesVolumeAndPlaybackPolls() {
         for isVolume in [false, true] {
             let controller = makeController()
@@ -96,6 +120,36 @@ final class SonyPlaybackConfirmationTests: XCTestCase {
     }
 
     #if !ACOUPLET_PUBLIC_APIS_ONLY
+    func testReplyStartingBeforeQueryTransmissionCannotBorrowItsRead() {
+        let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0xA7, 0x20, 9])
+        for split in 1..<encoded.count {
+            let controller = makeController()
+            defer { controller.simulateControlLoss() }
+            let readback = controller.musicVolumeReadbackID
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0xA9, 0x20, 12]))
+            controller.defersSimulatedWrites = true
+            controller.refresh()
+            for _ in 0..<30 {
+                guard let frame = controller.simulatedPendingFrame, frame.payload != [0xA6, 0x20] else { break }
+                controller.completeSimulatedWrite()
+                controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x01, sequence: 1 - frame.sequence, payload: []))
+            }
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0xA6, 0x20])
+            controller.simulateProtocolData(encoded.prefix(split))
+            controller.completeSimulatedWrite()
+            controller.simulateProtocolData(encoded.dropFirst(split))
+            controller.completeSimulatedWrite()
+            XCTAssertEqual(controller.musicVolumeReadbackID, readback)
+            XCTAssertFalse(controller.hasFreshMusicVolumeReadback)
+            controller.defersSimulatedWrites = false
+            acknowledgeSimulatedCommands(controller)
+            receive([0xA7, 0x20, 10], on: controller)
+            receive([0xA3, 1, 0, 2, 0], on: controller)
+            XCTAssertNotEqual(controller.musicVolumeReadbackID, readback)
+            XCTAssertTrue(controller.hasFreshMusicVolumeReadback)
+        }
+    }
+
     func testReplyReceivedBeforeQueryTransmissionCannotBorrowItsRead() {
         let controller = makeController()
         let readback = controller.musicVolumeReadbackID

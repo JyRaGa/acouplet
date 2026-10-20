@@ -121,7 +121,7 @@ final class LDACNativeOutput {
         }
         do { try Self.acquireRouteOwner(); holdsRouteOwner = true }
         catch {
-            throw OutputError("macOS could not reserve LDAC route ownership: \(error.localizedDescription)", userFacing: String(localized: "macOS did not make LDAC audio available. Try again."))
+            throw OutputError("macOS could not reserve LDAC route ownership: \(Self.diagnosticDescription(error))", userFacing: String(localized: "macOS did not make LDAC audio available. Try again."))
         }
         self.model = model
         restoringOwner = recovering != nil
@@ -161,7 +161,7 @@ final class LDACNativeOutput {
         sampleRateHz = Float64(sampleRate.rawValue)
         do { try setLease(true) }
         catch {
-            throw OutputError("macOS could not claim the experimental LDAC output: \(error.localizedDescription)", userFacing: String(localized: "macOS did not make LDAC audio available. Try again."))
+            throw OutputError("macOS could not claim the experimental LDAC output: \(Self.diagnosticDescription(error))", userFacing: String(localized: "macOS did not make LDAC audio available. Try again."))
         }
         ownsLease = true
         leaseActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "LDAC audio playback")
@@ -679,11 +679,17 @@ final class LDACNativeOutput {
         AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
     }
 
-    private struct OutputError: LocalizedError {
+    static func diagnosticDescription(_ error: Error) -> String {
+        (error as? OutputError)?.diagnosticDescription ?? error.localizedDescription
+    }
+
+    struct OutputError: LocalizedError {
         let message: String
+        let diagnosticDescription: String
         var errorDescription: String? { message }
         init(_ message: String, userFacing: String? = nil) {
             self.message = userFacing ?? message
+            diagnosticDescription = message
             if userFacing != nil { LDACNativeOutput.logger.error("\(message, privacy: .private)") }
         }
     }

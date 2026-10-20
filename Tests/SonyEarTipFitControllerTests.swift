@@ -3,6 +3,47 @@ import XCTest
 
 final class SonyEarTipFitControllerTests: XCTestCase {
     @MainActor
+    func testEntryRejectsFrameStartedBeforeEnterTransmission() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            let id = try prepare(controller)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frame = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: modeIn)
+            controller.simulateProtocolData(frame.prefix(4))
+            controller.defersSimulatedWrites = deferred
+            controller.startEarTipFit(id: id)
+            controller.defersSimulatedWrites = false
+            if deferred { controller.completeSimulatedWrite() }
+            controller.simulateProtocolData(frame.dropFirst(4))
+            XCTAssertEqual(controller.earTipFitTransition?.phase, .entering)
+            XCTAssertEqual(controller.earTipFit.status?.mode, .out)
+            deliver(modeIn, to: controller)
+            XCTAssertEqual(controller.earTipFitTransition?.phase, .starting)
+        }
+    }
+
+    @MainActor
+    func testDiscoveryRejectsFrameStartedBeforeQueryTransmission() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frame = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: initialReplies[0])
+            controller.simulateProtocolData(frame.prefix(4))
+            controller.defersSimulatedWrites = deferred
+            XCTAssertTrue(controller.beginEarTipFit())
+            controller.defersSimulatedWrites = false
+            if deferred { controller.completeSimulatedWrite() }
+            controller.simulateProtocolData(frame.dropFirst(4))
+            XCTAssertEqual(controller.earTipFitTransition?.phase, .checking)
+            XCTAssertNil(controller.earTipFit.capability)
+            deliver(initialReplies[0], to: controller)
+            XCTAssertNotNil(controller.earTipFit.capability)
+        }
+    }
+
+    @MainActor
     func testDismissingHeadphoneTestAfterDeviceSelectionReleasesOnlyItsOwner() throws {
         for practice in [false, true] {
             let devices = SonyDeviceCoordinator(fallbackController: SonyHeadphonesController(startAutomatically: false, simulated: true)) { device in

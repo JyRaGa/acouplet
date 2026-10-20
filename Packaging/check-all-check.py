@@ -61,12 +61,17 @@ with tempfile.TemporaryDirectory(prefix='acouplet-check-all-check-') as director
     for path in runner['python_checks']:
         assert Path(path).name in scripts, path
     assert 'check-helper.py' in scripts and 'check-ldac-cli.py' in scripts and 'check-sparkle-bundle.py' in scripts
+    assert 'LDACLogFreeConnectionCheck.py' in scripts
     volume_check = next(command for command in commands if len(command) > 1 and Path(command[1]).name == 'LDACControllerVolumeCheck.py')
     assert volume_check[2:] == ['--check-mutations']
     bundle_check = next(command for command in commands if len(command) == 4 and Path(command[1]).name == 'check-localizations.py')
     assert bundle_check[-1] == str(extraction.parent)
     assert any(Path(command[0]).name == 'BannerLifetimeCheck' for command in commands)
     assert any(Path(command[0]).name == 'LDACSessionDiagnosticsCheck' for command in commands)
+    for check in ('LDACLogFreeSignalingTests', 'LDACLogFreeMediaTests'):
+        compile = next(command for command in commands if str(repo / 'Helpers/LDAC' / (check + '.m')) in command)
+        assert compile[:2] == ['/usr/bin/xcrun', 'clang'] and '-DACOUPLET_LDAC_PROBE_ONLY=0' in compile
+        assert commands[commands.index(compile) + 1] == [compile[-1]]
     assert not any(Path(word).name in ('check-service.sh', 'NativeHUDCheck', 'install', 'direct.sh', 'package.sh', 'fetch-sparkle.sh') for command in commands for word in command)
     assert not any('AcoupletUITests' in word for command in commands for word in command)
     for result_summary in ({'passedTests': 0, 'failedTests': 0},

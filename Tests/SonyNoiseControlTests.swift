@@ -207,6 +207,38 @@ final class SonyNoiseControlControllerTests: XCTestCase {
         XCTFail("The command queue did not drain.")
     }
 
+    func testModernNoiseNotificationSupersedesLateBackgroundRead() async {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        controller.simulateDeviceConnection(named: "WF-1000XM5")
+        let session = controller.simulatedControlSession
+        for _ in 0..<5 { controller.simulateAutomaticRefresh() }
+        acknowledgeAll(controller)
+        deliver([0x69, 0x19, 1, 1, 1, 0, 12, 1, 0], to: controller)
+        XCTAssertTrue(controller.isReady)
+        XCTAssertTrue(controller.canChangeNoiseControl)
+        controller.simulateNoiseReadTimeout([0x66, 0x19])
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertTrue(controller.isReady)
+        XCTAssertEqual(controller.simulatedControlSession, session)
+        XCTAssertNotNil(controller.noiseControlMode)
+        let reads = controller.simulatedTransmittedFrames.filter { $0.payload == [0x66, 0x19] }.count
+        for _ in 0..<10 { controller.simulateAutomaticRefresh() }
+        acknowledgeAll(controller)
+        XCTAssertEqual(controller.simulatedTransmittedFrames.filter { $0.payload == [0x66, 0x19] }.count, reads)
+        controller.setNoiseControl(.anc)
+        acknowledgeAll(controller)
+        let requested = controller.pendingChanges[.noiseControl]
+        XCTAssertNotNil(requested)
+        deliver([0x67, 0x19, 1, 1, 0, 0, 12, 1, 0], to: controller)
+        XCTAssertEqual(controller.noiseControlMode, .ambient)
+        XCTAssertEqual(controller.pendingChanges[.noiseControl], requested)
+        if let requested { deliver([0x69] + requested, to: controller) }
+        XCTAssertNil(controller.pendingChanges[.noiseControl])
+        XCTAssertEqual(controller.noiseControlMode, .anc)
+        XCTAssertEqual(controller.simulatedControlSession, session)
+    }
+
     func testHandshakeRequiresOwnedMetadataAndKeepsChangingNoiseUnavailable() throws {
         for inquiry: UInt8 in [0x17, 0x19] {
             let extra: [UInt8] = inquiry == 0x19 ? [1, 2] : []

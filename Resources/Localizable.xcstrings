@@ -16687,6 +16687,193 @@
           }
         }
       }
+    },
+    "Turn off touch-panel backlight when idle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn off touch-panel backlight when idle"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Boştayken dokunmatik panel ışığını kapat"
+          }
+        }
+      }
+    },
+    "Updating touch-panel backlight": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Updating touch-panel backlight"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dokunmatik panel ışığı güncelleniyor"
+          }
+        }
+      }
+    },
+    "Reduces power use by turning off the top touch-panel backlight after inactivity.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reduces power use by turning off the top touch-panel backlight after inactivity."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bir süre kullanılmadığında üst dokunmatik panelin ışığını kapatarak güç tüketimini azaltır."
+          }
+        }
+      }
+    },
+    "Touch-panel backlight settings became unavailable before the change could be sent.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Touch-panel backlight settings became unavailable before the change could be sent."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Değişiklik gönderilemeden dokunmatik panel ışığı ayarları kullanılamaz hâle geldi."
+          }
+        }
+      }
+    },
+    "STAMINA": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA"
+          }
+        }
+      }
+    },
+    "Updating STAMINA": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Updating STAMINA"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA güncelleniyor"
+          }
+        }
+      }
+    },
+    "Reduces power use by changing sound effects and, on supported speakers, lighting.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reduces power use by changing sound effects and, on supported speakers, lighting."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ses efektlerini ve desteklenen hoparlörlerde aydınlatmayı değiştirerek güç tüketimini azaltır."
+          }
+        }
+      }
+    },
+    "Change STAMINA?": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Change STAMINA?"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA değiştirilsin mi?"
+          }
+        }
+      }
+    },
+    "Turning STAMINA on or off changes sound effects and may change lighting. Continue?": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turning STAMINA on or off changes sound effects and may change lighting. Continue?"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA’yı açmak veya kapatmak ses efektlerini ve aydınlatmayı değiştirebilir. Devam edilsin mi?"
+          }
+        }
+      }
+    },
+    "STAMINA settings changed before the confirmation could be sent.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA settings changed before the confirmation could be sent."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Onay gönderilemeden STAMINA ayarları değişti."
+          }
+        }
+      }
+    },
+    "STAMINA became unavailable before the change could be sent.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "STAMINA became unavailable before the change could be sent."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Değişiklik gönderilemeden STAMINA kullanılamaz hâle geldi."
+          }
+        }
+      }
     }
   },
   "version": "1.1"

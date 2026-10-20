@@ -4,6 +4,34 @@ import IOBluetooth
 
 final class SonyMultipointControllerTests: XCTestCase {
     @MainActor
+    func testNotificationStartingBeforeSetterCannotRequestReadbackAfterTransmission() {
+        let payload: [UInt8] = [0xD9, 0xD2, 0, 1]
+        let bytes = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: payload)
+        for split in 1..<bytes.count {
+            let controller = preparedController()
+            defer { controller.simulateControlLoss() }
+            acknowledgeAll(controller)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0xFE]))
+            controller.simulateProtocolData(bytes.prefix(split))
+            controller.defersSimulatedWrites = true
+            controller.setMultipointEnabled(false)
+            controller.completeSimulatedWrite()
+            XCTAssertEqual(controller.multipointTransition?.phase, .awaitingResponse)
+
+            controller.simulateProtocolData(bytes.dropFirst(split))
+            XCTAssertEqual(controller.multipointTransition?.phase, .awaitingResponse, "Split \(split)")
+            controller.completeSimulatedWrite()
+            controller.defersSimulatedWrites = false
+            acknowledgeAll(controller)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: payload))
+            acknowledgeAll(controller)
+            XCTAssertEqual(controller.multipointTransition?.phase, .verifying)
+            deliver([0xD7, 0xD2, 0, 1], to: controller)
+            XCTAssertEqual(controller.multipointTransition?.phase, .complete)
+        }
+    }
+
+    @MainActor
     func testMultipointWaitsForSettingNotificationAndOwnedReadback() throws {
         let controller = preparedController()
         controller.setMultipointEnabled(false)

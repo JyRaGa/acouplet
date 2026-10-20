@@ -5,7 +5,7 @@ import tempfile
 base = Path(__file__).resolve().parents[2]
 source = (base / 'Helpers/LDAC/PairedSonyConnectionProbe.m').read_text()
 timing = source[source.index('static void RunLoopFor('):source.index('static BOOL ParentInputEnded(')]
-normalize = timing[timing.index('static NSString *NormalizeAddress('):]
+normalize = timing[timing.index('static int FreshACLState('):]
 observer = source[source.index('@interface ConnectionObserver'):source.index('static int WatchConnection(')]
 cancel = source[source.index('        if (cancelled) {'):source.index('        printf("AFTER callback=', source.index('        if (cancelled) {'))]
 watch = source[source.index('static int WatchConnection('):source.index('int main(')]
@@ -21,12 +21,14 @@ __LIFETIME__
 #include <signal.h>
 #include <string.h>
 #include <sys/event.h>
+#include <time.h>
 #include <unistd.h>
 @class ConnectionObserver;
 @interface FixtureDevice : NSObject
 @property BOOL paired, connected;
 @property BluetoothConnectionHandle connectionHandle;
 @property NSUInteger closes, opens;
+- (id)classicPeer;
 + (FixtureDevice *)deviceWithAddressString:(NSString *)address;
 - (BOOL)isPaired;
 - (BOOL)isConnected;
@@ -63,11 +65,21 @@ static BOOL ParentExited(int descriptor) { return NO; }
 static int PriorityIdle(NSString *uid) { return 1; }
 static int NativeOutputState(NSString *address) { return publishAt >= 0 && elapsed >= publishAt ? 1 : fixtureNative; }
 static BOOL FixtureConnected(FixtureDevice *device) { return device.connected; }
+@interface FixturePeer : NSObject
+- (id)sendInternalSyncMsg:(int)message args:(id)arguments;
+@end
+@implementation FixturePeer
+- (id)sendInternalSyncMsg:(int)message args:(id)arguments {
+    assert(message == 0x2f && arguments == nil);
+    return @{@"kCBMsgArgState": @{@"kCBMsgArgInternalState": @(fixtureDevice.connected ? 2 : 0)}};
+}
+@end
 #define IOBluetoothDevice FixtureDevice
 #define SonyClassicIsConnected FixtureConnected
 ''' + normalize + observer + r'''
 @implementation FixtureDevice
 + (FixtureDevice *)deviceWithAddressString:(NSString *)address { return fixtureDevice; }
+- (id)classicPeer { return [FixturePeer new]; }
 - (BOOL)isPaired { return self.paired; }
 - (BOOL)isConnected { return self.connected; }
 - (IOReturn)closeConnection { self.closes++; self.connected = NO; return 0; }
@@ -78,7 +90,7 @@ static void Complete(void) {
     if (activeObserver && !activeObserver.done && completeAt >= 0 && elapsed >= completeAt)
         [activeObserver connectionComplete:fixtureDevice status:callbackStatus];
 }
-''' + watch + 'static int Cancel(FixtureDevice *device, ConnectionObserver *observer) { BOOL cancelled = YES;\n' + cancel + '\nreturn 8; }\n' + main + r'''
+''' + watch + 'static int Cancel(FixtureDevice *device, ConnectionObserver *observer) { BOOL cancelled = YES; int acquisitionFailure = 0;\n' + cancel + '\nreturn 8; }\n' + main + r'''
 static int Invoke(NSArray<NSString *> *arguments, BOOL connected, UInt16 handle, int native) {
     fixtureDevice = [FixtureDevice new];
     fixtureDevice.paired = YES;
@@ -113,7 +125,7 @@ int main(int argc, const char **argv) {
         int rejected = Invoke(connect, NO, 0, 0);
         assert(rejected == 3 && fixtureDevice.opens == 1 && fixtureDevice.closes == 0);
         acquisitionStatus = kIOReturnSuccess;
-        cancelAtCheck = 2;
+        cancelAtCheck = 3;
         int after = Invoke(connect, NO, 0, 0);
         assert(after == 0 && fixtureDevice.opens == 1 && fixtureDevice.closes == 0);
         cancelAtCheck = -1;

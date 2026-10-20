@@ -969,6 +969,9 @@ final class AppUITests: XCTestCase {
         for _ in 0..<4 {
             status.click()
             XCTAssertTrue(dashboard.waitForNonExistence(timeout: 3))
+            let reopened = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: dashboard)
+            reopened.isInverted = true
+            XCTAssertEqual(XCTWaiter.wait(for: [reopened], timeout: 1), .completed)
             status.click()
             XCTAssertTrue(dashboard.waitForExistence(timeout: 3))
         }

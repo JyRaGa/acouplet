@@ -12,6 +12,8 @@ struct SonyLegacyOptimizerTransition: Equatable {
     private(set) var result: SonyLegacyOptimizer.Measurements?
     private(set) var commandTransmitted = false
     private var reads: [UInt8: Phase] = [:]
+    private var readTransmissionOrdinals: [UInt8: UInt64] = [:]
+    private var commandTransmissionOrdinal: UInt64?
     private var initialReceived: Set<UInt8> = []
     private var statusRequestedFor: Phase?
     private var statusReadSuperseded = false
@@ -62,17 +64,22 @@ struct SonyLegacyOptimizerTransition: Equatable {
         hasOutstandingReads || phase == .running || ((phase == .starting || phase == .cancelling) && commandTransmitted)
     }
 
-    mutating func transmitted(_ payload: [UInt8], session: UInt64) {
+    mutating func transmitted(_ payload: [UInt8], session: UInt64, transmissionOrdinal: UInt64 = 0) {
         guard self.session == session, hasControl else { return }
         if payload == SonyLegacyOptimizer.startPayload, phase == .starting || phase == .cancelling {
             startTransmitted = true
-            if phase == .starting { commandTransmitted = true }
+            if phase == .starting {
+                commandTransmitted = true
+                commandTransmissionOrdinal = transmissionOrdinal
+            }
         } else if payload == SonyLegacyOptimizer.cancelPayload, phase == .cancelling {
             commandTransmitted = true
+            commandTransmissionOrdinal = transmissionOrdinal
         } else if pendingQueries.contains(payload)
                     || (phase == .checking && closing && initialQueries.contains(payload)) {
             let owner: Phase = phase == .running ? .starting : phase
             reads[payload[0]] = owner
+            readTransmissionOrdinals[payload[0]] = transmissionOrdinal
             if payload == SonyLegacyOptimizer.statusQuery {
                 statusReadSuperseded = false
                 if phase != .checking { statusRequestedFor = owner }
@@ -80,13 +87,21 @@ struct SonyLegacyOptimizerTransition: Equatable {
         }
     }
 
-    func accepts(_ payload: [UInt8], session: UInt64) -> Bool {
+    func accepts(_ payload: [UInt8], session: UInt64, transmissionOrdinal: UInt64 = .max) -> Bool {
         guard self.session == session, hasControl, payload.count >= 2, payload[1] == 1 else { return false }
         switch payload[0] {
-        case 0x81, 0x83, 0x87: return reads[payload[0] - 1] != nil
-        case 0x85: return [.ready, .starting, .running, .readingResult, .cancelling].contains(phase)
-            || (phase == .checking && (reads[0x82] != nil || initialReceived.contains(0x82)))
+        case 0x81, 0x83, 0x87:
+            return reads[payload[0] - 1] != nil && readTransmissionOrdinals[payload[0] - 1].map { transmissionOrdinal >= $0 } == true
+        case 0x85:
+            if phase == .ready { return true }
+            if phase == .checking {
+                return (reads[0x82] != nil || initialReceived.contains(0x82))
+                    && readTransmissionOrdinals[0x82].map { transmissionOrdinal >= $0 } == true
+            }
+            return [.starting, .running, .readingResult, .cancelling].contains(phase)
+                && commandTransmissionOrdinal.map { transmissionOrdinal >= $0 } != false
         case 0x89: return phase == .readingResult && reads[0x86] == .readingResult
+            && readTransmissionOrdinals[0x86].map { transmissionOrdinal >= $0 } == true
         default: return false
         }
     }
@@ -218,5 +233,6 @@ struct SonyLegacyOptimizerTransition: Equatable {
     private mutating func move(to phase: Phase) {
         self.phase = phase
         commandTransmitted = false
+        if expectedPayload != nil { commandTransmissionOrdinal = nil }
     }
 }

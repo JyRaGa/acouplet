@@ -25,6 +25,7 @@ python_checks = (
     'Helpers/LDAC/LDACSessionClosureCheck.py',
     'Helpers/LDAC/LDACCaptureStartupCheck.py',
     'Helpers/LDAC/LDACConnectionOwnershipCheck.py',
+    'Helpers/LDAC/LDACLogFreeConnectionCheck.py',
     'Helpers/LDAC/LDACOwnerLifecycleCheck.py',
     'Helpers/LDAC/LDACOwnerExitCheck.py',
     'Packaging/check-all-check.py',
@@ -78,6 +79,18 @@ def main():
         ):
             binary = Path(directory) / Path(check).stem
             run('/usr/bin/xcrun', 'swiftc', '-swift-version', '6', '-parse-as-library', repo / source, repo / check, '-o', binary)
+            run(binary)
+        encoder = repo / 'Vendor/libldac'
+        for check, arguments in (
+            ('Helpers/LDAC/LDACLogFreeSignalingTests.m', []),
+            ('Helpers/LDAC/LDACLogFreeMediaTests.m', ['-I', encoder / 'inc', '-I', encoder / 'src',
+                                                  encoder / 'src/ldacBT.c', encoder / 'src/ldaclib.c']),
+        ):
+            binary = Path(directory) / Path(check).stem
+            run('/usr/bin/xcrun', 'clang', '-fobjc-arc', '-fblocks', '-Werror', '-D_DARWIN_C_SOURCE',
+                '-DACOUPLET_LDAC_PROBE_ONLY=0', '-mmacosx-version-min=15.4',
+                '-framework', 'Foundation', '-framework', 'CoreFoundation', '-framework', 'CoreBluetooth',
+                '-framework', 'IOBluetooth', repo / check, *arguments, '-o', binary)
             run(binary)
     print('\nAll local checks passed.', flush=True)
 

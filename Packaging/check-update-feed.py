@@ -174,13 +174,17 @@ if CommandLine.arguments.count == 1 {
     subprocess.run(['/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', fixture, second / 'Fixture-1.2.4.zip'], check=True)
     (second / 'Fixture-1.2.4.md').write_text('Second native generator notes.\n')
     subprocess.run([release.SPARKLE / 'generate_appcast', '--ed-key-file', '-', '--download-url-prefix', release.github_download_prefix('fixture/repo', '1.2.4'),
-                    '--release-notes-url-prefix', release.PREFIX, '--disable-signing-warning', '--maximum-versions', '0', '--maximum-deltas', '0', second],
+                    '--release-notes-url-prefix', release.PREFIX, '--full-release-notes-url', release.HISTORY_URL,
+                    '--disable-signing-warning', '--maximum-versions', '0', '--maximum-deltas', '0', second],
                    input=fixture_key, capture_output=True, text=True, check=True, env={**os.environ, 'CFFIXED_USER_HOME': str(generator_home)})
     for path in second.iterdir(): shutil.copy2(path, generated / path.name)
     assert release.verify_updates(root, generated, public_key, 43, '1.2.4', repository='fixture/repo') == 43
     urls = {item.findtext(release.NS + 'version'): item.find('enclosure').attrib['url'] for item in ET.parse(generated / 'appcast.xml').findall('./channel/item')}
     assert urls['42'] == old_url
     assert urls['43'] == release.github_download_prefix('fixture/repo', '1.2.4') + 'Fixture-1.2.4.zip'
+    latest = next(item for item in ET.parse(generated / 'appcast.xml').findall('./channel/item') if item.findtext(release.NS + 'version') == '43')
+    assert latest.findtext(release.NS + 'fullReleaseNotesLink') == release.HISTORY_URL
+    assert latest.findtext(release.NS + 'releaseNotesLink') == release.PREFIX + 'Fixture-1.2.4.md'
     print('official generator preserves older GitHub release URLs when generating only the new archive: passed')
     checksums = root / 'native-SHA256SUMS'
     checksums.write_text('Fixture checksum list.\n')
@@ -210,6 +214,7 @@ if CommandLine.arguments.count == 1 {
             assert input is None and '--ed-key-file' not in words
             assert words[words.index('--account') + 1] == 'fixture-account'
             assert words[words.index('--maximum-versions') + 1] == '0'
+            assert words[words.index('--full-release-notes-url') + 1] == release.HISTORY_URL
             assert '--disable-signing-warning' in words
             folder = Path(words[-1])
             rss = ET.parse(folder / 'appcast.xml').getroot() if (folder / 'appcast.xml').exists() else ET.Element('rss', {'version': '2.0'})

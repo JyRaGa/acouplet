@@ -3,6 +3,46 @@ import XCTest
 
 final class SonyHeadGesturePracticeControllerTests: XCTestCase {
     @MainActor
+    func testCancellationRejectsFrameStartedBeforeExitTransmission() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            let id = try practice(controller)
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frame = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: modeOut)
+            controller.simulateProtocolData(frame.prefix(4))
+            controller.defersSimulatedWrites = deferred
+            controller.cancelHeadGesturePractice(id: id)
+            controller.defersSimulatedWrites = false
+            if deferred { controller.completeSimulatedWrite() }
+            controller.simulateProtocolData(frame.dropFirst(4))
+            XCTAssertEqual(controller.headGesturePracticeTransition?.phase, .leaving)
+            deliver(modeOut, to: controller)
+            XCTAssertEqual(controller.headGesturePracticeTransition?.phase, .finished)
+        }
+    }
+
+    @MainActor
+    func testDiscoveryRejectsFrameStartedBeforeQueryTransmission() throws {
+        for deferred in [false, true] {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0]))
+            let frame = SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: available)
+            controller.simulateProtocolData(frame.prefix(4))
+            controller.defersSimulatedWrites = deferred
+            XCTAssertTrue(controller.beginHeadGesturePractice())
+            controller.defersSimulatedWrites = false
+            if deferred { controller.completeSimulatedWrite() }
+            controller.simulateProtocolData(frame.dropFirst(4))
+            XCTAssertEqual(controller.headGesturePracticeTransition?.phase, .checking)
+            XCTAssertFalse(controller.canStartHeadGesturePractice)
+            deliver(available, to: controller)
+            XCTAssertEqual(controller.headGesturePracticeTransition?.phase, .ready)
+        }
+    }
+
+    @MainActor
     func testDismissingPracticeSheetRetainsOwnershipUntilConfirmedExit() throws {
         for outcome in ["confirmed", "disconnected", "timeout"] {
             let controller = readyController()

@@ -114,6 +114,7 @@ final class SonyHeadphonesController: ObservableObject {
     var hasFreshMusicVolumeReadback: Bool { hasCurrentMusicVolumeControl && canControlMusicVolume }
     var canControlMusicVolume: Bool { hasCurrentMusicVolumeControl && !blocksPlaybackCommands && queuedWrite == nil }
     func hasCurrentMusicSourceContext(for address: String?) -> Bool { localSource }
+    func connectionModeUnavailableReason(_ mode: SonyConnectionMode) -> String? { nil }
     func setConnectionMode(_ mode: SonyConnectionMode) {
         guard mode != connectionMode, connectionTransition?.isFinished != false else { return }
         connectionRequests.append(mode)
@@ -219,8 +220,10 @@ typealias LDACOwnerSession = LDACNativeSession
 @MainActor
 final class LDACNativeSession {
     struct Helpers { var isAvailable = true }
+    struct Diagnostic { var stage: String; var detail: String; var isFailure = false }
     struct Completion { var message: String?; var canRetry = false; var requiresAttention = false; var targetDisconnected = false; var waitForReconnect = false }
     enum Event {
+        case diagnostic(Diagnostic)
         case handoffReady, connecting, active(LDACFormat), formatChanged(LDACFormat), gainApplied(Double)
         case audioCaptureAccess(LDACAudioCaptureAccess), failed(String), connectionLost(String), finished(Completion)
     }
@@ -267,6 +270,7 @@ final class Controller: ObservableObject {
     var sessionID = UUID()
     var requestedAddress: String?
     var requestedConfiguration = LDACConfiguration()
+    var diagnosticAttempt = 0
     var nativeOutput: LDACNativeOutput?
     var outputID: UUID?
     var headphones: SonyHeadphonesController?
@@ -307,6 +311,8 @@ final class Controller: ObservableObject {
     let helpers = LDACNativeSession.Helpers()
     var devices: SonyDeviceCoordinator? = SonyDeviceCoordinator()
     func observeControls(_ headphones: SonyHeadphonesController, devices: SonyDeviceCoordinator) {}
+    func recordOutputFailure(_ error: Error) {}
+    func recordNativeDiagnostic(_ diagnostic: LDACNativeSession.Diagnostic) {}
     func record(_ event: String, reason: String) {}
     __METHODS__
     struct ControlError: LocalizedError {

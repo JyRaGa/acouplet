@@ -15,7 +15,8 @@ struct SonyEarTipFitTransition: Equatable {
     private(set) var series = SonyEarTipFit.Series.other
     private(set) var commandTransmitted = false
     private(set) var dismissWhenFinished = false
-    private var writtenQueries: Set<[UInt8]> = []
+    private var writtenQueries: [[UInt8]: UInt64] = [:]
+    private var commandTransmissionOrdinal: UInt64?
     private var receivedQueries: Set<[UInt8]> = []
     private var closing = false
     private var preparingAgain = false
@@ -54,29 +55,32 @@ struct SonyEarTipFitTransition: Equatable {
         }
     }
 
-    mutating func transmitted(_ payload: [UInt8], session: UInt64) {
+    mutating func transmitted(_ payload: [UInt8], session: UInt64, transmissionOrdinal: UInt64 = 0) {
         guard self.session == session else { return }
         if phase == .checking {
-            if initialQueries.contains(payload) { writtenQueries.insert(payload) }
+            if initialQueries.contains(payload) { writtenQueries[payload] = transmissionOrdinal }
         } else if payload == expectedPayload {
             commandTransmitted = true
+            commandTransmissionOrdinal = transmissionOrdinal
         }
     }
 
-    func accepts(_ payload: [UInt8], session: UInt64) -> Bool {
+    func accepts(_ payload: [UInt8], session: UInt64, transmissionOrdinal: UInt64 = .max) -> Bool {
         guard self.session == session, payload.count >= 2 else { return false }
         if phase == .checking {
             if [0xF5, 0xF9].contains(payload[0]) {
-                return receivedQueries.contains([payload[0] - 3, payload[1]])
+                let query = [payload[0] - 3, payload[1]]
+                return receivedQueries.contains(query) && writtenQueries[query].map { transmissionOrdinal >= $0 } == true
             }
             guard [0xF1, 0xF3, 0xF7].contains(payload[0]) else { return false }
             let query = [payload[0] - 1, payload[1]]
-            return writtenQueries.contains(query) && !receivedQueries.contains(query)
+            return writtenQueries[query].map { transmissionOrdinal >= $0 } == true && !receivedQueries.contains(query)
         }
         if payload[1] == 0x07 {
             return supportsEarpieceSelection && phase == .ready && payload[0] == 0xF9
         }
         guard payload[1] == 0x06 else { return false }
+        if phase != .ready, let commandTransmissionOrdinal, transmissionOrdinal < commandTransmissionOrdinal { return false }
         return !canDismiss && [0xF5, 0xF9, 0xFD].contains(payload[0])
     }
 
@@ -133,7 +137,7 @@ struct SonyEarTipFitTransition: Equatable {
                 if preparingAgain && status.available && status.result == .noError {
                     result = nil
                     message = nil
-                    writtenQueries = []
+                    writtenQueries = [:]
                     receivedQueries = []
                     move(to: .checking)
                 } else {
@@ -224,5 +228,6 @@ struct SonyEarTipFitTransition: Equatable {
     private mutating func move(to phase: Phase) {
         self.phase = phase
         commandTransmitted = false
+        if expectedPayload != nil { commandTransmissionOrdinal = nil }
     }
 }

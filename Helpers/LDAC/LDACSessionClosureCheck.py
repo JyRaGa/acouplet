@@ -76,8 +76,9 @@ final class SessionEvents {
     var values: [LDACNativeSession.Event] = []
 
     var names: [String] {
-        values.map {
+        values.compactMap {
             switch $0 {
+            case .diagnostic: nil
             case .connectionLost: "connectionLost"
             case .failed: "failed"
             case .active: "active"
@@ -88,16 +89,114 @@ final class SessionEvents {
     }
 }
 
+final class FixturePriority: @unchecked Sendable {
+    let lock = NSLock()
+    var enabled = false
+    var requests: [Bool] = []
+
+    var control: LDACPriorityControl {
+        LDACPriorityControl(request: { enabled, removed in
+            self.lock.withLock {
+                self.enabled = enabled
+                self.requests.append(enabled)
+            }
+        }, state: {
+            self.lock.withLock { .init(phase: self.enabled ? "configured" : "idle", error: nil) }
+        })
+    }
+}
+
 extension LDACNativeSession.Helpers {
     init(fixture: URL) {
         signaling = fixture
         media = fixture
         capture = fixture
         connection = fixture
-        logger = URL(fileURLWithPath: "/usr/bin/log")
     }
 }
 extension LDACNativeSession {
+    @MainActor
+    static func logfreePlaybackCheck(executable: URL) async throws {
+        let events = SessionEvents()
+        let priority = FixturePriority()
+        let session = LDACNativeSession(id: UUID(), address: "02:00:00:00:00:01",
+            helpers: Helpers(fixture: executable), gain: 0.25, outputDeviceUID: "fixture-output",
+            priority: priority.control, receive: { events.values.append($0) })
+        session.start()
+        var handedOff = false
+        var stopped = false
+        var gainApplied = false
+        let deadline = DispatchTime.now() + 15
+        while DispatchTime.now() < deadline {
+            if !handedOff, events.values.contains(where: { if case .handoffReady = $0 { return true }; return false }) {
+                session.allowHandoff()
+                handedOff = true
+            }
+            if !gainApplied, events.values.contains(where: { if case .active = $0 { return true }; return false }) {
+                session.updateGain(0.5)
+                gainApplied = true
+            }
+            if !stopped, events.values.contains(where: { if case .gainApplied(0.5) = $0 { return true }; return false }) {
+                session.stop(restoreAudio: false)
+                stopped = true
+            }
+            if events.values.contains(where: { if case .finished = $0 { return true }; return false }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        defer {
+            cleanUp(Array(session.children.values))
+            if let raw = session.rawURL { try? FileManager.default.removeItem(at: raw.deletingLastPathComponent()) }
+        }
+        guard case let .finished(completion)? = events.values.last else {
+            throw ClosureCheckError(description: "Log-free fixture did not complete within fifteen seconds")
+        }
+        try require(handedOff && gainApplied && stopped && completion.message == nil,
+            "Log-free capture/playback/stop failed: \(completion.message ?? "missing active state")")
+        try require(priority.lock.withLock { priority.requests } == [true, false], "Playback priority did not bracket the live feed")
+        try require(session.captureDestroyed && session.captureStoppedCleanly && session.connectorSettled,
+            "Capture or connection guardian cleanup was not confirmed")
+        try require(session.signalingGate.closed && session.mediaGate.closed && !session.shutdownUnverified,
+            "Owned channel callbacks did not confirm shutdown")
+        let log = try String(contentsOf: session.rawURL!.deletingLastPathComponent().appendingPathComponent("session.log"), encoding: .utf8)
+        try require(!log.contains("LAUNCH daemon") && !log.contains("transport-closed") && !log.contains("COMMAND probe 0x"),
+            "Log-free playback still required daemon framing or fabricated closure")
+        for (first, second) in [("SIGNALING_ARMED", "LAUNCH disconnect"), ("ACL_CONNECTED", "COMMAND probe acquire"),
+            ("CONNECT_READY", "LAUNCH media"), ("PREPARE_MEDIA", "LAUNCH media"),
+            ("PCM_CAPTURE_READY", "COMMAND probe media-ready"), ("PCM_READY", "COMMAND probe media-ready"),
+            ("PRIORITY_CONFIGURATION_ATTEMPT_COMPLETED", "COMMAND media start"),
+            ("FEED_COMPLETE", "PRIORITY_STOP_REQUESTED"), ("DESTROY_TAP", "COMMAND probe media-finished"),
+            ("media OWNED_CLOSED", "COMMAND probe media-closed")] {
+            guard let before = log.range(of: first), let after = log.range(of: second) else {
+                throw ClosureCheckError(description: "Missing lifecycle marker: \(first), \(second)")
+            }
+            try require(before.lowerBound < after.lowerBound, "Out-of-order log-free lifecycle: \(first), \(second)")
+        }
+    }
+
+    static func acquisitionCheck(executable: URL) throws {
+        let now = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+        for (baseline, connection, armed, prior, valid) in [
+            (now - 2, now - 1, now - 3, false, true),
+            (now - 4, now - 1, now - 3, false, false),
+            (now - 1, now - 2, now - 3, false, false),
+            (now - 2, now + 10_000_000_000, now - 3, false, false),
+            (now - 3_000_000_000, now - 2_000_000_000, now - 4_000_000_000, false, false),
+            (now - 2, now - 1, now - 3, true, false)
+        ] {
+            let session = LDACNativeSession(id: UUID(), address: "02:00:00:00:00:01",
+                helpers: Helpers(fixture: executable), gain: 0, receive: { _ in })
+            session.signalingArmed = armed
+            session.connected = prior
+            let probe = try LDACNativeChild(executable: URL(fileURLWithPath: "/bin/cat"), arguments: [], inheritedPCM: nil)
+            defer { cleanUp([probe]) }
+            session.children["probe"] = probe
+            var accepted = true
+            do { try session.handle("connector", line: "ACL_CONNECTED baseline_ns=\(baseline) connected_ns=\(connection)") }
+            catch { accepted = false }
+            try require(accepted == valid, "Fresh ACL validation accepted a stale, reordered, future or repeated event")
+        }
+    }
+
     static func finishChildrenCheck(executable: URL) throws {
         for stubborn in [false, true] {
             let session = LDACNativeSession(id: UUID(), address: "02:00:00:00:00:01", helpers: Helpers(fixture: executable), gain: 0) { _ in }
@@ -274,30 +373,6 @@ extension LDACNativeSession {
     }
 
     @MainActor
-    static func loggerAuthorizationCheck() async throws {
-        for source in ["daemon", "probe", "media"] {
-            let events = SessionEvents()
-            let session = LDACNativeSession(id: UUID(), address: "02:00:00:00:00:01",
-                helpers: Helpers(bundle: .main), gain: 0, receive: { events.values.append($0) })
-            try session.handle(source, line: "log: Must be admin to run 'stream' command")
-            if source == "daemon" {
-                session.fail("Bluetooth logging ended before LDAC was stopped.")
-                session.finish()
-            }
-            for _ in 0..<100 { await Task.yield() }
-            let messages = events.values.compactMap { event -> String? in
-                switch event {
-                case .failed(let message): message
-                case .finished(let completion): completion.message
-                default: nil
-                }
-            }
-            let expected = source == "daemon" ? Array(repeating: "LDAC requires a macOS administrator account.", count: 2) : []
-            try require(messages == expected, "Logger authorization failure was misattributed or replaced by a retry message")
-        }
-    }
-
-    @MainActor
     static func failurePresentationCheck(logURL: URL) async throws {
         let raw = "PCM_FAILED helper=probe reason=nonfinite sourceSamples=128"
         for (mode, expected) in [
@@ -335,6 +410,12 @@ extension LDACNativeSession {
                 }
             }
             try require(messages == [expected, expected], "Internal failure reached public events in \(mode): \(messages)")
+            let diagnosticFailures = events.values.compactMap { event -> LDACNativeSession.Diagnostic? in
+                if case let .diagnostic(value) = event, value.isFailure { return value }
+                return nil
+            }
+            try require(diagnosticFailures.contains { $0.detail == "PCM_FAILED reason=nonfinite" }, "Native failure detail did not reach copyable diagnostics")
+            try require(diagnosticFailures.allSatisfy { !$0.detail.contains("sourceSamples") && !$0.detail.contains("helper=probe") }, "Raw helper line reached copyable diagnostics")
             try require(session.failure == raw, "Failure presentation changed internal failure state")
             try require(String(contentsOf: logURL, encoding: .utf8).contains(raw), "Failure detail was lost from diagnostics")
         }
@@ -413,8 +494,7 @@ extension LDACNativeSession {
         session.pcmReady = true
         for (name, cid) in [("probe", "0040"), ("media", "0041")] {
             var gate = LDACChannelGate()
-            try gate.owned("OWNED_CHANNEL CID=\(cid)")
-            try gate.daemon("connectedCB cid:0x\(cid) inMTU:1000 outMTU:1000 result:0")
+            try gate.owned("OWNED_OPEN CID=\(cid) outgoingMTU=1000")
             if name == "probe" { session.signalingGate = gate }
             else { session.mediaGate = gate }
         }
@@ -475,16 +555,16 @@ extension LDACNativeSession {
         let session = try lossSession(active: !["setup", "closed-before-active"].contains(mode), events: events)
         if mode == "stopping" { session.stop(restoreAudio: false) }
         let closed = "FEED_COMPLETE result=5 strictPass=0 sentPackets=1 drainedPackets=1 closed=1"
-        let daemon = "l2capDisconnected for CID: 0x0041"
+        let callback = "OWNED_CLOSED CID=0041"
         let encoder = "ENCODER_FAILED reason=packet-boundary bytes=700 outgoingMTU=679 baseline=1000"
         var lines: [(String, String)]
         switch mode {
-        case "media-first": lines = [("media", closed), ("daemon", daemon)]
-        case "daemon-first": lines = [("daemon", daemon), ("media", closed)]
-        case "daemon-then-encoder": lines = [("daemon", daemon), ("media", encoder), ("media", closed)]
+        case "media-first": lines = [("media", closed), ("media", callback)]
+        case "callback-first": lines = [("media", callback), ("media", closed)]
+        case "callback-then-encoder": lines = [("media", callback), ("media", encoder), ("media", closed)]
         case "closed-before-active": lines = [("media", closed)]
-        case "encoder-first": lines = [("media", encoder), ("media", closed), ("daemon", daemon)]
-        case "closure-first": lines = [("media", closed), ("media", encoder), ("daemon", daemon)]
+        case "encoder-first": lines = [("media", encoder), ("media", closed), ("media", callback)]
+        case "closure-first": lines = [("media", closed), ("media", encoder), ("media", callback)]
         case "pcm-error": lines = [("media", "PCM_FAILED reason=nonfinite sourceSamples=128 gain=1"), ("media", closed)]
         case "open-error": lines = [("media", "FEED_COMPLETE result=5 strictPass=0 sentPackets=1 closed=0")]
         case "unknown-error": lines = [("media", "FEED_COMPLETE result=5 strictPass=0 sentPackets=1")]
@@ -497,8 +577,8 @@ extension LDACNativeSession {
             catch { session.fail(error.localizedDescription) }
             if line == encoder { try require(session.hardFailure, "Encoder diagnostic did not immediately retain hard failure") }
         }
-        let recoverable = ["media-first", "daemon-first", "closure-first", "daemon-then-encoder"].contains(mode)
-        let hard = !["media-first", "daemon-first", "stopping"].contains(mode)
+        let recoverable = ["media-first", "callback-first", "closure-first", "callback-then-encoder"].contains(mode)
+        let hard = !["media-first", "callback-first", "stopping"].contains(mode)
         try require(session.feedFinished && session.shouldStop, "Media completion did not enter shutdown")
         try require(session.recoverableFailure == recoverable && session.hardFailure == hard,
             "Media closure/error classification depended on child output order: \(mode)")
@@ -507,7 +587,7 @@ extension LDACNativeSession {
             try session.handle("media", line: closed)
         }
         for _ in 0..<100 { await Task.yield() }
-        let expected = mode == "stopping" ? [] : ["closure-first", "daemon-then-encoder"].contains(mode) ? ["connectionLost", "failed"]
+        let expected = mode == "stopping" ? [] : ["closure-first", "callback-then-encoder"].contains(mode) ? ["connectionLost", "failed"]
             : [hard ? "failed" : "connectionLost"]
         try require(events.names == expected, "Media failure emitted incorrect or repeated events: \(events.names)")
     }
@@ -537,7 +617,7 @@ extension LDACNativeSession {
         }
         for (name, cid) in [("probe", "0040"), ("media", "0041")] {
             if !["missing-closure", "requested-stop-missing-closure"].contains(mode) || name != "media" {
-                try session.handle("daemon", line: "l2capDisconnected for CID: 0x\(cid)")
+                try session.handle(name, line: "OWNED_CLOSED CID=\(cid)")
             }
             session.children[name] = try LDACNativeChild(executable: executable,
                 arguments: ["--fixture", "exit", "FIXTURE_EXIT", "", mode == "unexpected-exit" && name == "probe" ? "6" : "5"],
@@ -582,10 +662,9 @@ extension LDACNativeSession {
         session.rawURL = raw
         for (name, cid) in [("probe", "0040"), ("media", "0041")] {
             var gate = LDACChannelGate()
-            try gate.owned("OWNED_CHANNEL CID=\(cid)")
-            try gate.daemon("connectedCB cid:0x\(cid) inMTU:672 outMTU:672 result:0")
+            try gate.owned("OWNED_OPEN CID=\(cid) outgoingMTU=672")
             if fault != "missing-closure" || name != (site == "media-transport" ? "media" : "probe") {
-                try gate.daemon("l2capDisconnected for CID: 0x\(cid)")
+                try gate.owned("OWNED_CLOSED CID=\(cid)")
             }
             if name == "probe" { session.signalingGate = gate }
             else { session.mediaGate = gate }
@@ -664,8 +743,7 @@ extension LDACNativeSession {
                 "Terminal acknowledgment failed: \(session.failure ?? "unknown")")
         }
         if fault == "none" {
-            let sent = site == "media-transport" ? session.mediaTransportClosedSent :
-                site == "media-closed" ? session.mediaClosedSent : session.signalingClosedSent
+            let sent = session.mediaClosedSent
             try require(sent == (mode == "read"), "Terminal acknowledgment delivery was recorded incorrectly")
         }
         if mode == "broken" {
@@ -719,8 +797,65 @@ enum LDACSessionClosureCheck {
         exit(Int32(arguments[5])!)
     }
 
+    static func helperFixture() -> Bool {
+        func output(_ line: String) { print(line); fflush(stdout) }
+        let arguments = CommandLine.arguments
+        guard arguments.count > 1 else { return false }
+        switch arguments[1] {
+        case "--check-permission":
+            output("AUDIO_PERMISSION_ALLOWED cleanup=1 callbacks=1")
+        case "--playback-disconnected":
+            output("SIGNALING_ARMED time_ns=\(clock_gettime_nsec_np(CLOCK_MONOTONIC))")
+            guard readLine()?.hasPrefix("acquire ") == true else { exit(81) }
+            output("OWNED_OPEN CID=0040 outgoingMTU=1000")
+            output("PREPARE_MEDIA")
+            guard readLine() == "media-prepared" else { exit(82) }
+            output("OPEN_ACCEPTED")
+            guard readLine() == "media-ready 41 1000" else { exit(83) }
+            output("START_ACCEPTED")
+            guard readLine() == "media-finished" else { exit(84) }
+            output("MEDIA_CLOSE_REQUIRED")
+            output("WAIT_MEDIA_CLOSED")
+            guard readLine() == "media-closed" else { exit(85) }
+            output("STOP_COMPLETE protocolCleanup=1")
+            output("OWNED_CLOSED CID=0040")
+        case "--media":
+            output("MEDIA_PREPARED")
+            guard readLine() == "open" else { exit(86) }
+            output("OWNED_OPEN CID=0041 outgoingMTU=1000")
+            output("READY CID=0041 outgoingMTU=1000 socketFD=3 PSM=0019 rate=48000 channels=2 bitrateKbps=330 eqmid=2")
+            output("PCM_READY frames=12000 rate=48000 channels=2 format=F32")
+            guard readLine() == "start live 0.25 0" else { exit(87) }
+            output("LIVE_SENT packets=1 rate=48000 channels=2 bitrateKbps=330 eqmid=2")
+            guard readLine() == "gain 0.5" else { exit(88) }
+            output("GAIN_APPLIED gain=0.5")
+            guard readLine() == "stop" else { exit(89) }
+            output("FEED_COMPLETE result=0")
+            guard readLine() == "close" else { exit(90) }
+            output("OWNED_CLOSED CID=0041")
+        case "--stream":
+            output("PCM_CAPTURE_READY rate=48000 channels=2 format=F32 interleaved=1 bytesPerFrame=8")
+            var mask = sigset_t()
+            sigemptyset(&mask)
+            sigaddset(&mask, SIGTERM)
+            var received: Int32 = 0
+            guard sigwait(&mask, &received) == 0, received == SIGTERM else { exit(91) }
+            output("DESTROY_TAP status=0")
+        case "--address" where arguments.contains("--watch-parent"):
+            let now = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+            output("ACL_CONNECTED baseline_ns=\(now - 1) connected_ns=\(now)")
+            usleep(100_000)
+            output("CONNECT_READY handle=0001 guarded=1")
+            guard readLine() == "disarm" else { exit(92) }
+            output("CONNECT_DISARMED explicit=1 connected=1")
+        default: return false
+        }
+        return true
+    }
+
     @MainActor
     static func main() async throws {
+        if helperFixture() { return }
         if CommandLine.arguments.dropFirst().first == "--address" || CommandLine.arguments.dropFirst().first == "fixture-disconnect" {
             print("FIXTURE_ARGS " + CommandLine.arguments.dropFirst().joined(separator: " "))
             return
@@ -737,6 +872,9 @@ enum LDACSessionClosureCheck {
         }
         if CommandLine.arguments.dropFirst().first == "--fixture" { child() }
         let executable = URL(fileURLWithPath: CommandLine.arguments[0])
+        try LDACNativeSession.acquisitionCheck(executable: executable)
+        try await LDACNativeSession.logfreePlaybackCheck(executable: executable)
+        print("PASS log-free acquisition, deferred media, live capture, gain, priority and owned shutdown")
         for handle in [nil, 0, 1] as [Int?] {
             try LDACNativeSession.checkRestoreArguments(executable: executable, handle: handle)
         }
@@ -763,26 +901,9 @@ enum LDACSessionClosureCheck {
             print("PASS pipe setup failure=\(failure): descriptors closed without spawning a helper")
         }
         PipeSetupCheck.failureCall = 0
-        let signalingInput = try LDACNativeChild(executable: URL(fileURLWithPath: CommandLine.arguments[2]),
-            arguments: [], inheritedPCM: nil)
-        defer { cleanUp([signalingInput]) }
-        var signalingLines: [String] = []
-        try waitUntil {
-            signalingLines += try signalingInput.readLines()
-            signalingInput.reap()
-            return signalingInput.finished
-        }
-        try require(signalingInput.exitCode == 0 && signalingLines.contains("FIXTURE_RX_INTACT length=4096"),
-            "Signaling diagnostics modified the received protocol data")
-        let dumps = signalingLines.filter { $0.hasPrefix("RX ") }
-        try require(dumps.count == 1 && dumps[0].contains("length=4096 bytes=") && dumps[0].hasSuffix(" ...")
-            && dumps[0].utf8.count < 1024, "Signaling diagnostic exceeded its bounded preview")
-        print("PASS 4096-byte signaling input: complete protocol data and bounded parent-readable diagnostic")
         let raw = executable.deletingLastPathComponent().appendingPathComponent("signaling.bin")
         try Data().write(to: raw)
         try LDACNativeSession.finishChildrenCheck(executable: executable)
-        try await LDACNativeSession.loggerAuthorizationCheck()
-        print("PASS logger authorization failure retains its account requirement")
         for role in ["preflight", "capture"] {
             for signal in [SIGINT, SIGTERM] {
                 try LDACNativeSession.captureStartupSignalCheck(role, signal: signal,
@@ -806,7 +927,7 @@ enum LDACSessionClosureCheck {
             print("PASS capture cancellation mode=\(mode)")
         }
         var failures = 0
-        for site in ["media-transport", "media-closed", "signaling-transport"] {
+        for site in ["media-closed"] {
             for (mode, fault) in [("exit", "none"), ("broken", "none"), ("read", "none"),
                                   ("exit", "missing-closure"), ("exit", "failed-exit"),
                                   ("broken", "hung"), ("exit", "nonterminal"), ("broken", "nonterminal"),
@@ -820,7 +941,7 @@ enum LDACSessionClosureCheck {
                 }
             }
         }
-        print("Actual LDAC session shutdown checks: \(30 - failures)/30 passed; local fixture children only")
+        print("Actual LDAC session shutdown checks: \(10 - failures)/10 passed; local fixture children only")
         let closureFailures = failures
         var ownershipChecks = 0
         for line in ["PEER_COMMAND_UNSUPPORTED", "CONTROL_FAILED expected=media-finished closed=0", "LDAC_UNAVAILABLE rate=48000 channels=2"] {
@@ -839,7 +960,7 @@ enum LDACSessionClosureCheck {
                 }
             }
         }
-        for mode in ["media-first", "daemon-first", "encoder-first", "closure-first", "daemon-then-encoder",
+        for mode in ["media-first", "callback-first", "encoder-first", "closure-first", "callback-then-encoder",
                      "pcm-error", "open-error", "unknown-error", "setup", "closed-before-active", "stopping"] {
             ownershipChecks += 1
             do {
@@ -873,6 +994,7 @@ with tempfile.TemporaryDirectory(prefix="acouplet-ldac-session-closure-") as dir
     directory = pathlib.Path(directory)
     swift = directory / "Check.swift"
     binary = directory / "check"
+    source = source.replace('FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]', 'FileManager.default.temporaryDirectory.appendingPathComponent("acouplet-session-fixture-\\(getpid())")')
     timed_source = source.replace("DispatchTime.now()", "SessionClock.shared.monotonic").replace("Date()", "SessionClock.shared.wallTime")
     timed_source = timed_source.replace("        guard fcntl(incoming[1]", "        PipeSetupCheck.descriptors = incoming + outgoing\n        guard fcntl(incoming[1]")
     timed_source = timed_source.replace("fcntl(", "PipeSetupCheck.configure(")
@@ -902,222 +1024,5 @@ static volatile sig_atomic_t interrupted;
 }
 ''')
     subprocess.run(["xcrun", "clang", str(signal_source), "-o", str(signal_binary)], check=True)
-    signaling_source = (pathlib.Path(__file__).parent / "DirectAVDTPSustainedPlaybackProbe.m").read_text()
-    poll = signaling_source[signaling_source.index("@implementation DirectPlaybackProbe"):signaling_source.index("\n@end", signaling_source.index("@implementation DirectPlaybackProbe")) + len("\n@end")]
-    signaling_fixture = directory / "SignalingInput.m"
-    signaling_binary = directory / "signaling-input"
-    signaling_fixture.write_text('''#import <Foundation/Foundation.h>
-@interface DirectPlaybackProbe : NSObject
-@property BOOL closed, failed, closing, inputEnded;
-@property(strong) NSInputStream *input;
-@property(strong) NSObject *channel;
-@property(strong) NSMutableData *pending, *raw;
-@property NSUInteger received;
-- (void)pollInput;
-@end
-''' + poll + '''
-int main(void) {
-    @autoreleasepool {
-        NSMutableData *expected = [NSMutableData dataWithLength:4096];
-        uint8_t *bytes = expected.mutableBytes;
-        for (NSUInteger i = 0; i < expected.length; i++) bytes[i] = (uint8_t)i;
-        DirectPlaybackProbe *probe = [DirectPlaybackProbe new];
-        probe.pending = [NSMutableData data];
-        probe.raw = [NSMutableData data];
-        probe.closing = YES;
-        probe.input = [NSInputStream inputStreamWithData:expected];
-        [probe.input open];
-        [probe pollInput];
-        [probe.input close];
-        if (![probe.pending isEqualToData:expected] || ![probe.raw isEqualToData:expected] || probe.received != 4096) return 1;
-        puts("FIXTURE_RX_INTACT length=4096");
-    }
-    return 0;
-}
-''')
-    subprocess.run(["xcrun", "clang", "-fobjc-arc", "-framework", "Foundation", str(signaling_fixture), "-o", str(signaling_binary)], check=True)
     subprocess.run(["xcrun", "swiftc", "-swift-version", "6", "-parse-as-library", str(swift), "-o", str(binary)], check=True)
-    subprocess.run([str(binary), str(signal_binary), str(signaling_binary)], check=True)
-    connection_source = (pathlib.Path(__file__).parent / "PairedSonyConnectionProbe.m").read_text()
-    media_source = (pathlib.Path(__file__).parent / "DirectAVDTPLiveMediaProbe.m").read_text()
-    timing = signaling_source[signaling_source.index("static void RunLoopFor("):signaling_source.index("static NSString *NormalizeAddress(")]
-    for helper_source in [signaling_source, connection_source, media_source]:
-        assert "dateWithTimeIntervalSinceNow:" not in helper_source and ".timeIntervalSinceNow" not in helper_source
-        start = helper_source.index("static void RunLoopFor(")
-        end = helper_source.index("\n}\n", helper_source.index("static double MonotonicTime(", start)) + len("\n}\n")
-        assert helper_source[start:end].strip() == timing.strip()
-    probe = signaling_source[signaling_source.index("@interface DirectPlaybackProbe"):signaling_source.index("static NSString *ReadLine(")]
-    read = signaling_source[signaling_source.index("static NSString *ReadLine("):signaling_source.index("static NSArray<NSNumber *> *DecodeReply(")]
-    response = signaling_source[signaling_source.index("static NSData *AwaitResponse("):signaling_source.index("static NSData *Query(")]
-    control = signaling_source[signaling_source.index("static BOOL WaitControl("):signaling_source.index("static BOOL LDACSelection(")]
-    closed = signaling_source[signaling_source.index("static void WaitTransportClosed("):signaling_source.index("int main(")]
-    connection_lock = connection_source[connection_source.index("static int ConnectionLock("):connection_source.index("static BOOL ReadAudio(")]
-    observer = connection_source[connection_source.index("@interface ConnectionObserver"):connection_source.index("static int WatchConnection(")]
-    watch = connection_source[connection_source.index("static int WatchConnection("):connection_source.index("int main(")]
-    start = media_source.index("        double openDeadline =")
-    opening = media_source[start:media_source.index("        if (openExpired)", start)]
-    clock_fixture = directory / "NativeClock.m"
-    clock_binary = directory / "native-clock"
-    clock_fixture.write_text(r'''#import <Foundation/Foundation.h>
-#import <CoreBluetooth/CoreBluetooth.h>
-#import <IOBluetooth/IOBluetooth.h>
-#include <assert.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <math.h>
-#include <poll.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
-#include <dispatch/dispatch.h>
-static double elapsed, wallOffset, jump;
-static NSUInteger ticks;
-static BOOL disarmed;
-static int commandFD = -1;
-static uint64_t ClockNanoseconds(clockid_t clock) {
-    assert(clock == CLOCK_MONOTONIC);
-    return (uint64_t)(elapsed * 1000000000.0);
-}
-static SInt32 ClockRunLoop(CFRunLoopMode mode, CFTimeInterval seconds, Boolean returnAfterSourceHandled) {
-    assert(CFEqual(mode, kCFRunLoopDefaultMode) && seconds > 0 && !returnAfterSourceHandled);
-    assert(++ticks < 100);
-    elapsed += 1;
-    wallOffset = jump;
-    if (commandFD >= 0) {
-        assert(write(commandFD, "stop\n", 5) == 5);
-        commandFD = -1;
-    }
-    return kCFRunLoopRunTimedOut;
-}
-@interface ClockDate : NSObject
-+ (NSDate *)date;
-@end
-@implementation ClockDate
-+ (NSDate *)date { return [NSDate dateWithTimeIntervalSince1970:1700000000 + elapsed + wallOffset]; }
-@end
-#define NSDate ClockDate
-#define clock_gettime_nsec_np ClockNanoseconds
-#define CFRunLoopRunInMode ClockRunLoop
-''' + timing + r'''
-#undef CFRunLoopRunInMode
-#undef clock_gettime_nsec_np
-''' + probe + read + r'''
-static BOOL HandlePeerCommand(DirectPlaybackProbe *probe, NSData *packet) { abort(); }
-''' + response + control + closed + r'''
-static BOOL ParentInputEnded(void) { return NO; }
-static BOOL ParentExited(int events) { return YES; }
-static int NativeOutputState(NSString *address) { return 0; }
-static int PriorityIdle(NSString *uid) { return 0; }
-''' + (pathlib.Path(__file__).parent.parent / "SonyClassicConnection.h").read_text() + connection_lock + observer + watch + r'''
-@interface ClockDevice : NSObject
-@property BluetoothConnectionHandle connectionHandle;
-- (BOOL)isConnected;
-@end
-@implementation ClockDevice
-- (BOOL)isConnected { return YES; }
-@end
-@interface ClockMediaProbe : NSObject
-@property BOOL stdinEnded, closeRequested, failed;
-@end
-@implementation ClockMediaProbe
-@end
-static NSString *AvailableCommand(ClockMediaProbe *probe) { return nil; }
-static BOOL MediaOpenTimeout(void) {
-    ClockMediaProbe *probe = [ClockMediaProbe new];
-    BOOL openDone = NO;
-''' + opening + r'''
-    return openExpired;
-}
-static void ResetClock(void) { elapsed = 0; wallOffset = 0; ticks = 0; }
-static void CheckElapsed(double expected) {
-    assert(elapsed == expected && wallOffset == jump);
-    assert(NSDate.date.timeIntervalSince1970 == 1700000000 + expected + jump);
-}
-#undef NSDate
-''' + timing.replace("RunLoopFor", "NativeRunLoopFor").replace("MonotonicTime", "NativeMonotonicTime") + r'''
-int main(void) {
-    @autoreleasepool {
-        __block BOOL handled = NO, dispatched = NO;
-        dispatch_async(dispatch_get_main_queue(), ^{ dispatched = YES; });
-        CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL, CFAbsoluteTimeGetCurrent() + 0.01,
-            0, 0, 0, ^(CFRunLoopTimerRef timer) { handled = YES; });
-        CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
-        double started = NativeMonotonicTime();
-        NativeRunLoopFor(0.03);
-        assert(handled && dispatched && NativeMonotonicTime() - started < 1);
-        CFRunLoopTimerInvalidate(timer);
-        CFRelease(timer);
-        int input[2];
-        assert(pipe(input) == 0);
-        int original = dup(STDIN_FILENO);
-        assert(original >= 0 && dup2(input[0], STDIN_FILENO) >= 0);
-        close(input[0]);
-        for (NSUInteger direction = 0; direction < 2; direction++) {
-            jump = direction ? -3600 : 3600;
-            DirectPlaybackProbe *probe = [DirectPlaybackProbe new];
-            probe.pending = [NSMutableData data];
-            probe.controlPending = [NSMutableData data];
-            probe.continuous = YES;
-            ResetClock();
-            assert(!ReadLine(probe, MonotonicTime() + 3, NO, 0.001));
-            CheckElapsed(3);
-            ResetClock();
-            assert(!ConsumeSDU(probe, @"0x500C 2", MonotonicTime() + 3));
-            CheckElapsed(3);
-            const uint8_t accepted[] = {0x42, 0x08};
-            NSData *packet = [NSData dataWithBytes:accepted length:sizeof(accepted)];
-            [probe.pending appendData:packet];
-            assert([ConsumeSDU(probe, @"0x500C 2", MonotonicTime() + 3) isEqualToData:packet]);
-            ResetClock();
-            assert(!FramedReply(probe, MonotonicTime() + 3));
-            CheckElapsed(3);
-            ResetClock();
-            assert(!AwaitResponse(probe, 1, 1));
-            CheckElapsed(30);
-            ResetClock();
-            assert(!WaitControl(probe, @"media-ready"));
-            CheckElapsed(30);
-            ResetClock();
-            commandFD = input[1];
-            assert([ReadLine(probe, INFINITY, NO, 0.001) isEqualToString:@"stop"] && probe.stopRequested);
-            CheckElapsed(1);
-            ResetClock();
-            probe.stdinEnded = YES;
-            WaitTransportClosed(probe);
-            assert(probe.failed && !probe.closed);
-            CheckElapsed(2);
-            ResetClock();
-            assert(MediaOpenTimeout());
-            CheckElapsed(5);
-            ResetClock();
-            NSString *address = [NSString stringWithFormat:@"clock-fixture-%d-%lu", getpid(), direction];
-            int held = ConnectionLock(address, NO);
-            assert(held >= 0 && ConnectionLock(address, NO) == -1);
-            CheckElapsed(5);
-            close(held);
-            NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                [NSString stringWithFormat:@"dev.baglayan.Acouplet.audio-%@.lock", address]];
-            assert(unlink(path.fileSystemRepresentation) == 0);
-            ResetClock();
-            ClockDevice *device = [ClockDevice new];
-            device.connectionHandle = 1;
-            ConnectionObserver *observer = [ConnectionObserver new];
-            observer.originalHandle = 1;
-            assert(WatchConnection((IOBluetoothDevice *)device, observer, address, @"fixture", -1) == 6);
-            alarm(0);
-            CheckElapsed(45);
-            printf("PASS native helper clock jump=%.0f: signaling reply/control/close, media open, connection lock/recovery deadlines and epoch logs; no devices accessed\n", jump);
-        }
-        assert(dup2(original, STDIN_FILENO) >= 0);
-        close(original);
-        close(input[1]);
-    }
-    return 0;
-}
-''')
-    subprocess.run(["xcrun", "clang", "-fobjc-arc", "-fblocks", "-D_DARWIN_C_SOURCE", "-DACOUPLET_LDAC_PROBE_ONLY=0", "-framework", "Foundation", "-framework", "CoreFoundation", str(clock_fixture), "-o", str(clock_binary)], check=True)
-    result = subprocess.run([str(clock_binary)], check=True, capture_output=True, text=True, timeout=15)
-    for timestamp in ["1700003603.000000", "1699996403.000000"]:
-        assert "SDU_GATE time=" + timestamp in result.stdout, result.stdout
-    print(result.stdout, end="")
+    subprocess.run([str(binary), str(signal_binary)], check=True)

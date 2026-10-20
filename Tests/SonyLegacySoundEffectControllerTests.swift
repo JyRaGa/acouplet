@@ -97,6 +97,56 @@ final class SonyLegacySoundEffectControllerTests: XCTestCase {
         XCTAssertTrue(controller.legacySurround.canSet)
     }
 
+    func testNotificationStartingBeforeTransmissionCannotConfirmAfterWriteCompletes() {
+        for (kind, inquiry, preset): (SonyLegacySoundEffect.Kind, UInt8, UInt8) in [(.surround, 1, 3), (.soundPosition, 2, 0x11)] {
+            let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0x49, inquiry, preset])
+            for split in 1...encoded.count {
+                let controller = readyController()
+                defer { controller.simulateControlLoss() }
+                controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x49, inquiry, 0]))
+                controller.defersSimulatedWrites = true
+                controller.setLegacySoundEffect(kind, preset: preset)
+                controller.simulateProtocolData(encoded.prefix(split))
+                controller.completeSimulatedWrite()
+                if split < encoded.count { controller.simulateProtocolData(encoded.dropFirst(split)) }
+                controller.completeSimulatedWrite()
+                XCTAssertEqual(controller.pendingChanges[.legacySoundEffect(kind)], [inquiry, preset])
+                controller.defersSimulatedWrites = false
+                acknowledgeAll(controller)
+                controller.refresh()
+                acknowledgeAll(controller)
+                deliver([0x49, inquiry, preset], to: controller)
+                XCTAssertNil(controller.pendingChanges[.legacySoundEffect(kind)])
+            }
+        }
+    }
+
+    func testParameterReplyStartingBeforeQueryCannotConsumeTheLaterRead() {
+        let encoded = SonyFrameCodec.encode(type: 0x0C, sequence: 1, payload: [0x47, 1, 2])
+        for split in 1..<encoded.count {
+            let controller = readyController()
+            defer { controller.simulateControlLoss() }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x0C, sequence: 0, payload: [0x49, 1, 0]))
+            controller.defersSimulatedWrites = true
+            controller.refresh()
+            for _ in 0..<50 {
+                guard let frame = controller.simulatedPendingFrame, frame.payload != [0x46, 1] else { break }
+                controller.completeSimulatedWrite()
+                controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x01, sequence: 1 - frame.sequence, payload: []))
+            }
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x46, 1])
+            controller.simulateProtocolData(encoded.prefix(split))
+            controller.completeSimulatedWrite()
+            controller.simulateProtocolData(encoded.dropFirst(split))
+            controller.completeSimulatedWrite()
+            XCTAssertEqual(controller.legacySurround.presetID, 0)
+            controller.defersSimulatedWrites = false
+            acknowledgeAll(controller)
+            deliver([0x47, 1, 3], to: controller)
+            XCTAssertEqual(controller.legacySurround.presetID, 3)
+        }
+    }
+
     func testOldParameterReadCannotUndoNotificationOrConfirmALaterWrite() {
         let controller = readyController()
         defer { controller.simulateControlLoss() }

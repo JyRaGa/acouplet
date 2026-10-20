@@ -4,6 +4,7 @@ import sys
 
 helpers = Path(sys.argv[1]) / 'Contents/Helpers'
 for name, arguments in [
+    ('LDACSignaling', []),
     ('LDACSignaling', ['--discover']),
     ('LDACSignaling', ['--discover', '--address', '02-00-00-00-00-01']),
     ('LDACSignaling', ['--discover-disconnected', '--address', '02-00-00-00-00-01']),
@@ -14,7 +15,7 @@ for name, arguments in [
     ('LDACLogObserver', []),
 ]:
     result = subprocess.run([str(helpers / name), *arguments], capture_output=True, text=True, timeout=15)
-    assert result.returncode == 2, (name, result.returncode, result.stderr)
+    assert result.returncode == 2, (name, arguments, result.returncode, result.stdout, result.stderr)
     assert 'BEFORE' not in result.stdout, name
 
 for name in ['LDACSignaling', 'LDACMediaTransport']:

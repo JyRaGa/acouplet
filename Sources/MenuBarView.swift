@@ -299,7 +299,7 @@ struct MenuBarView: View {
                 ))
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .tint(.accentColor)
+                .tint(settings.tintColor)
                 .disabled(!ldacIsEnabled && (!ldac.canEnable(forAddress: headphones.address) || !ldac.canStartOrInstallDriver))
                 .accessibilityValue(ldacStatusText)
                 .accessibilityIdentifier("audio.ldac")
@@ -331,16 +331,10 @@ struct MenuBarView: View {
                         }
                     }
                 if showsHeadphoneControls {
-                    HStack(spacing: 6) {
-                        if headphones.isApplyingChange || headphones.isEqualizerUpdatePending {
-                            ProgressView().controlSize(.mini)
-                                .accessibilityLabel("Applying headphone changes")
-                        }
-                        Text(headphones.statusText)
-                            .multilineTextAlignment(.center)
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    Text(headphones.statusText)
+                        .multilineTextAlignment(.center)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             if headphones.isReady, headphones.isChargingInCase {
@@ -546,7 +540,7 @@ struct MenuBarView: View {
                         Toggle("Focus on Voice", isOn: Binding(get: { headphones.focusOnVoice }, set: headphones.setFocusOnVoice))
                             .labelsHidden()
                             .toggleStyle(.switch)
-                            .tint(.accentColor)
+                            .tint(settings.tintColor)
                     }
                 }
             }
@@ -892,7 +886,6 @@ struct HeadphoneConnectionView: View {
                         } else if headphones.isBluetoothAccessDenied {
                             Text("Allow Acouplet to use Bluetooth in [System Settings](x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth).")
                                 .foregroundStyle(.secondary)
-                                .tint(.accentColor)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .padding(.leading, 26)
                         } else if !isLoading {
@@ -903,13 +896,12 @@ struct HeadphoneConnectionView: View {
                                     .padding(.leading, 26)
                                     .accessibilityIdentifier("headphones.connectionFailure")
                                 Link("Bluetooth Settings…", destination: URL(string: "x-apple.systempreferences:com.apple.BluetoothSettings")!)
-                                    .foregroundStyle(Color.accentColor)
+                                    .foregroundStyle(.tint)
                                     .padding(.leading, 26)
                                     .accessibilityIdentifier("headphones.bluetoothSettings")
                             } else {
                                 Text("If this continues, disconnect and reconnect the headphones in [Bluetooth Settings](x-apple.systempreferences:com.apple.BluetoothSettings).")
                                     .foregroundStyle(.secondary)
-                                    .tint(.accentColor)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .padding(.leading, 26)
                                     .accessibilityIdentifier("headphones.bluetoothSettings")
@@ -1218,7 +1210,7 @@ private struct MultipointPopoverContent: View {
                 }
                 .buttonStyle(.borderless)
                 .tint(nil)
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(settings.tintColor)
                 .accessibilityIdentifier("multipoint.bluetoothSettings")
             }
             .padding(14)

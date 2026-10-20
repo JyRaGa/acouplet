@@ -60,6 +60,9 @@ final class Device: ObservableObject {
     var playback: Playback
     var earbudFinder: EarbudFinder?
     var supportsConnectionMode = true
+    var supportedConnectionModes: [SonyConnectionMode]? = [.soundQuality, .stableConnection, .lowLatency]
+    var connectionModeAvailable: Bool? = true
+    var connectionModeChecks = 0
     let address = "02:00:00:00:00:01"
     @Published var connectionMode: SonyConnectionMode? = .stableConnection
     @Published var connectionTransition: ConnectionTransition?
@@ -75,9 +78,19 @@ final class Device: ObservableObject {
     }
     func setConnectionMode(_ mode: SonyConnectionMode) {
         guard mode != connectionMode, connectionTransition?.isFinished != false else { return }
+        if let reason = connectionModeUnavailableReason(mode) {
+            connectionModeError = reason
+            return
+        }
         requests.append(mode)
         lastConnectionModeChangeID = UUID()
         connectionTransition = ConnectionTransition(phase: .awaitingResponse)
+    }
+    func connectionModeUnavailableReason(_ mode: SonyConnectionMode) -> String? {
+        connectionModeChecks += 1
+        guard supportedConnectionModes?.contains(mode) == true else { return "This mode is unavailable." }
+        guard connectionMode != nil, connectionModeAvailable == true else { return "Connection mode is unavailable." }
+        return nil
     }
     func confirm(_ mode: SonyConnectionMode) {
         connectionMode = mode
@@ -215,9 +228,9 @@ final class Controller: ObservableObject {
         state = .requested
         isSessionRunning = true
     }
-    func prepareQuality(_ address: String) async throws {
+    func prepareQuality(_ address: String, timeout: TimeInterval = 15) async throws {
         headphones = devices!.controller(for: address)!
-        try await prepareConnectionMode(headphones!, address: address, identifier: sessionID)
+        try await prepareConnectionMode(headphones!, address: address, identifier: sessionID, timeout: timeout)
     }
     func restoreQuality() async -> String? { await restoreConnectionMode() }
     func awaitChange(_ address: String, timeout: Duration) async throws -> Bool {
@@ -477,6 +490,86 @@ enum LDACControllerCleanupCheck {
             try! await unchanged.prepareQuality(address)
             precondition(unchangedHeadphones.requests.isEmpty && unchanged.connectionModeRestoreID == nil)
         }
+
+        for missing in ["mode", "capability", "availability"] {
+            let discovering = Controller(output: Output())
+            let device = discovering.devices!.controller(for: address)!
+            if missing == "mode" { device.connectionMode = nil }
+            if missing == "capability" { device.supportedConnectionModes = nil }
+            if missing == "availability" { device.connectionModeAvailable = nil }
+            precondition(discovering.deviceUnavailableReason(forAddress: address) == nil)
+            let preparation = Task { try await discovering.prepareQuality(address) }
+            await waitUntil { device.connectionModeChecks > 0 }
+            precondition(device.requests.isEmpty && discovering.connectionModeRestoreID == nil)
+            device.connectionMode = .stableConnection
+            device.supportedConnectionModes = [.soundQuality, .stableConnection]
+            device.connectionModeAvailable = true
+            let confirmation = Task {
+                for _ in 0..<200 where device.requests.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+                precondition(device.requests == [.soundQuality])
+                device.confirm(.soundQuality)
+            }
+            try! await preparation.value
+            try! await confirmation.value
+            precondition(discovering.connectionModeConfirmed)
+            precondition(discovering.connectionModeRestoreID == device.lastConnectionModeChangeID)
+        }
+
+        let discoveredQuality = Controller(output: Output())
+        let qualityDevice = discoveredQuality.devices!.controller(for: address)!
+        qualityDevice.connectionMode = nil
+        let qualityDiscovery = Task { try await discoveredQuality.prepareQuality(address) }
+        await waitUntil { qualityDevice.connectionModeChecks > 0 }
+        qualityDevice.connectionMode = .soundQuality
+        try! await qualityDiscovery.value
+        precondition(qualityDevice.requests.isEmpty && discoveredQuality.connectionModeRestoreID == nil)
+
+        let unavailable = Controller(output: Output())
+        let unavailableDevice = unavailable.devices!.controller(for: address)!
+        unavailableDevice.connectionModeAvailable = false
+        do {
+            try await unavailable.prepareQuality(address, timeout: 0.01)
+            preconditionFailure("Unavailable connection controls admitted LDAC")
+        } catch {
+            precondition(error.localizedDescription == "Connection mode is unavailable.")
+        }
+        precondition(unavailableDevice.requests.isEmpty && unavailable.connectionModeRestoreID == nil)
+
+        let discoveringOutput = Output()
+        let cancelledDiscovery = Controller(output: discoveringOutput)
+        let discoveringDevice = cancelledDiscovery.devices!.controller(for: address)!
+        discoveringDevice.connectionMode = nil
+        cancelledDiscovery.startTask = Task {
+            do { try await cancelledDiscovery.prepareQuality(address) }
+            catch {
+                precondition(error is CancellationError)
+                cancelledDiscovery.startTask = nil
+                cancelledDiscovery.sessionFinished()
+            }
+        }
+        await waitUntil { discoveringDevice.connectionModeChecks > 0 }
+        cancelledDiscovery.stop()
+        await waitUntil { discoveringOutput.continuation != nil }
+        discoveringOutput.continuation?.resume(returning: nil)
+        await waitUntil { !cancelledDiscovery.isSessionRunning }
+        precondition(discoveringDevice.requests.isEmpty && cancelledDiscovery.state == .off)
+        precondition(cancelledDiscovery.pendingConnectionModes.isEmpty && cancelledDiscovery.starts.isEmpty)
+
+        let replacedDiscovery = Controller(output: Output())
+        let replacedDevice = replacedDiscovery.devices!.controller(for: address)!
+        replacedDevice.connectionMode = nil
+        let replacedPreparation = Task { try await replacedDiscovery.prepareQuality(address) }
+        await waitUntil { replacedDevice.connectionModeChecks > 0 }
+        replacedDiscovery.devices!.controllers[address] = Device()
+        replacedDevice.connectionMode = .stableConnection
+        do {
+            try await replacedPreparation.value
+            preconditionFailure("Replaced headphone controller changed connection mode")
+        } catch {
+            precondition(error.localizedDescription == "The headphone connection changed. Try LDAC again.")
+        }
+        precondition(replacedDevice.requests.isEmpty && replacedDiscovery.connectionModeRestoreID == nil)
+        print("PASS connection discovery: delayed mode/capability/availability wait before setting; unavailable controls time out; cancellation cleans up; replacement never writes")
 
         let qualityOutput = Output()
         let quality = Controller(output: qualityOutput)
