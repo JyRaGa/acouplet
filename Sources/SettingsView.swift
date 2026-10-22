@@ -479,12 +479,16 @@ struct SettingsView: View {
                     Spacer()
                     Button("Copy Diagnostics") { copyDiagnostics() }
                 }
+                #if DEBUG
                 if headphones.protocolInformation?.generation != .v1 {
                     HStack {
                         Button("Connect Controls with Bluetooth LE") { headphones.connectBluetoothLE() }
-                            .disabled(headphones.usesBluetoothLE || headphones.linkState == .opening || headphones.linkState == .handshaking
+                            .disabled(headphones.usesBluetoothLE || headphones.isPreparingBluetoothLE || headphones.linkState == .opening || headphones.linkState == .handshaking
                                       || headphones.isPoweringOff
                                       || headphones.connectionTransition?.isFinished == false || headphones.multipointTransition?.isFinished == false)
+                        if headphones.isPreparingBluetoothLE {
+                            Button("Cancel") { headphones.cancelBluetoothLEPreparation() }
+                        }
                         if headphones.usesBluetoothLE {
                             Button("Reconnect Controls") { headphones.connect() }
                                 .disabled(headphones.isPoweringOff || headphones.connectionTransition?.isFinished == false || headphones.multipointTransition?.isFinished == false)
@@ -494,6 +498,7 @@ struct SettingsView: View {
                 if let error = headphones.bluetoothLEError {
                     Text(error).font(.caption).foregroundStyle(.primary)
                 }
+                #endif
             }
         }
         .tint(.primary)

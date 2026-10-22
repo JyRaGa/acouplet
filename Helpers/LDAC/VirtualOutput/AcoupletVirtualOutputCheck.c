@@ -18,6 +18,12 @@ static atomic_uint timerWakeups;
 static atomic_int deniedClient;
 static atomic_uint authenticationChecks;
 
+static void AcoupletPriorityCheckBootstrap(xpc_object_t request) {
+    assert(xpc_get_type(request) == XPC_TYPE_DICTIONARY && xpc_dictionary_get_count(request) == 1);
+    xpc_object_t uid = xpc_dictionary_get_value(request, "kBTAudioMsgDeviceUid");
+    assert(uid && xpc_get_type(uid) == XPC_TYPE_STRING && !strlen(xpc_string_get_string_ptr(uid)));
+}
+
 static Boolean AuthenticateClient(pid_t client) {
     atomic_fetch_add(&authenticationChecks, 1);
     assert(pthread_mutex_lock(&gPlugIn_StateMutex) == 0);
@@ -264,7 +270,7 @@ static void CheckClientAuthentication(CFStringRef address) {
     atomic_store(&deniedClient, 0);
     CFDictionaryRef state;
     Get(kObjectID_Device, owner, kAcoupletPriority, kAudioObjectPropertyScopeGlobal, sizeof(state), &state);
-    assert(CFDictionaryGetCount(state) == 3 &&
+    assert(CFDictionaryGetCount(state) == 4 &&
         CFEqual(CFDictionaryGetValue(state, CFSTR("address")), CFSTR("AA:BB:CC:DD:EE:FF")) &&
         CFEqual(CFDictionaryGetValue(state, CFSTR("error")), CFSTR("Private target detail")));
     CFRelease(state);
@@ -511,6 +517,35 @@ static void CheckScopedVolume(void) {
 
 static void CheckPriority(void) {
     CFStringRef address = CFSTR("aa-bb-cc-dd-ee-ff");
+    PriorityPhase(CFSTR("idle"));
+    xpc_object_t errors[] = {(xpc_object_t)XPC_ERROR_CONNECTION_INTERRUPTED, (xpc_object_t)XPC_ERROR_CONNECTION_INVALID};
+    CFStringRef reasons[] = {CFSTR("Audio-host connection was interrupted."), CFSTR("Audio-host connection was invalidated.")};
+    for (size_t index = 0; index < 2; ++index) {
+        assert(PreparePriority(owner, address, false, false) == noErr);
+        UInt64 sends = gPriorityCheckSends;
+        xpc_object_t error = errors[index];
+        dispatch_sync(gLeaseQueue, ^{ AcoupletPriorityEvent(error); });
+        PriorityPhase(CFSTR("preparation-failed"));
+        assert(!gPrioritySent && gPriorityCheckSends == sends && CFEqual(gPriorityError, reasons[index]));
+        assert(gPriorityAddress && gPriorityOwner == owner);
+        assert(SetPriority(owner, address, true, false) == kAudioHardwareIllegalOperationError);
+        CFPropertyListRef state = NULL;
+        Get(kObjectID_Device, owner, kAcoupletPriority, kAudioObjectPropertyScopeGlobal, sizeof(state), &state);
+        assert(CFDictionaryGetValue(state, CFSTR("prioritySent")) == kCFBooleanFalse);
+        assert(CFEqual(CFDictionaryGetValue(state, CFSTR("error")), reasons[index]));
+        CFRelease(state);
+        assert(SetPriority(owner, address, false, false) == noErr);
+        PriorityPhase(CFSTR("idle"));
+        assert(!gPriorityOwner && !gPriorityAddress && gPriorityCheckSends == sends);
+    }
+    assert(SetPriority(owner, address, true, false) == noErr);
+    dispatch_sync(gLeaseQueue, ^{
+        gPriorityDeadline = mach_absolute_time() - 1;
+        assert(AcoupletPriorityExpire());
+    });
+    PriorityPhase(CFSTR("preparation-failed"));
+    assert(!gPrioritySent && gPriorityOwner == owner && gPriorityAddress);
+    assert(SetPriority(owner, address, false, false) == noErr);
     PriorityPhase(CFSTR("idle"));
     assert(PreparePriority(owner + 1, address, false, false) == kAudioDevicePermissionsError);
     assert(PreparePriority(owner, address, true, false) == kAudioHardwareIllegalOperationError);
@@ -816,7 +851,7 @@ static void CheckRevision(void) {
     Get(kObjectID_Device, owner, kAcoupletRevision, kAudioObjectPropertyScopeGlobal, sizeof(revision), &revision);
     SInt32 value = 0;
     assert(revision && CFGetTypeID(revision) == CFNumberGetTypeID());
-    assert(CFNumberGetValue(revision, kCFNumberSInt32Type, &value) && value == kAcoupletDriverRevision && value == 5);
+    assert(CFNumberGetValue(revision, kCFNumberSInt32Type, &value) && value == kAcoupletDriverRevision && value == 6);
     assert((*driver)->SetPropertyData(driver, kObjectID_Device, owner, &property, 0, NULL,
         sizeof(revision), &revision) != noErr);
     CFRelease(revision);
@@ -1169,6 +1204,6 @@ int main(int argc, const char *argv[]) {
         !gPriorityConnection && gPriorityNotify == -1 && !gOwnerWatcher && gPriorityCheckStatus == 1);
     dispatch_release(requested);
     printf("HAL_TIMER_CHECK passed: zero idle timer callbacks across four 600 ms windows; %u active timer callbacks; lease expiry, priority deadline and owner-exit cleanup retained.\n", atomic_load(&timerWakeups));
-    puts("HAL_CALLBACK_CHECK passed: resource-bundle capacity/canary, activation/withdrawal, request failure, abort, stale generations, timer expiry, PID ownership, model identity, volume/mute, native rates and clocks; empty-bootstrap observing, explicit enable, publication replacement, passive owner loss, priority validation, opaque UID, notification ordering, deferred stop, disconnect-only removal with retained observer, deadline-before-event rejection, cleanup retry refusal before verified disconnect, scoped mute/volume with replacement-owner preservation and unrestricted system controls, and owner-exit cleanup; no live XPC or Bluetooth.");
+    puts("HAL_CALLBACK_CHECK passed: resource-bundle capacity/canary, activation/withdrawal, request failure, abort, stale generations, timer expiry, PID ownership, model identity, volume/mute, native rates and clocks; non-null empty UID bootstrap and observing, explicit enable, publication replacement, passive owner loss, priority validation, opaque UID, notification ordering, deferred stop, disconnect-only removal with retained observer, deadline-before-event rejection, cleanup retry refusal before verified disconnect, scoped mute/volume with replacement-owner preservation and unrestricted system controls, and owner-exit cleanup; no live XPC or Bluetooth.");
     return 0;
 }

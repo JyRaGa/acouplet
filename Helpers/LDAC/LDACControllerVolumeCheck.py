@@ -105,6 +105,7 @@ final class SonyHeadphonesController: ObservableObject {
     var musicVolumeReadbackID: UUID? = UUID()
     var musicStatusReadbackID: UUID? = UUID()
     var refreshes = 0
+    var settingsRefreshes = 0
     var volumeRefreshes = 0
     var queuedWrite: VolumeWrite?
     var blocksPlaybackCommands = false
@@ -127,12 +128,9 @@ final class SonyHeadphonesController: ObservableObject {
         connectionTransition = ConnectionTransition(phase: .confirmed)
     }
     func canPerformConfirmedSettingChange(_ setting: Setting) -> Bool { isReady && !blocksPlaybackCommands && queuedWrite == nil }
-    func refresh() {
-        refreshes += 1
-        guard isReady else { return }
-        musicVolumeReadbackID = UUID()
-        musicStatusReadbackID = UUID()
-    }
+    func refresh() { refreshes += 1 }
+    func requestCurrentSettings() { settingsRefreshes += 1 }
+    @discardableResult
     func refreshMusicVolume() -> Bool {
         guard isReady else { return false }
         volumeRefreshes += 1
@@ -342,7 +340,15 @@ enum Check {
         controller.devices?.controllers[headphones.address] = headphones
         controller.requestedAddress = headphones.address
         controller.start(headphones.address)
+        try await waitUntil { headphones.volumeRefreshes == 1 || headphones.refreshes != 0 }
+        precondition(headphones.refreshes == 0 && controller.session == nil,
+                     "LDAC startup refreshed unrelated settings or admitted stale volume")
+        headphones.receiveVolume()
+        try await Task.sleep(for: .milliseconds(120))
+        precondition(controller.session == nil, "LDAC startup admitted volume without fresh status")
+        headphones.receiveStatus()
         try await waitUntil { controller.session != nil }
+        headphones.volumeRefreshes = 0
         return (controller, headphones, controller.nativeOutput!, controller.session!)
     }
 
@@ -368,7 +374,7 @@ enum Check {
 
         headphones.isReady = false
         session.emit(.active(LDACFormat()))
-        precondition(headphones.refreshes == 2, "Disconnected legacy controls did not retain their reopen request")
+        precondition(headphones.refreshes == 1, "Disconnected legacy controls did not retain their reopen request")
         try await Task.sleep(for: .milliseconds(120))
         precondition(headphones.volumeRefreshes == 0 && controller.controlSession == nil && !output.ready)
         headphones.notificationSession += 1
@@ -408,7 +414,7 @@ enum Check {
         precondition(!output.ready)
         recovered.emit(.active(LDACFormat()))
         try await waitUntil { headphones.volumeRefreshes == refreshes + 1 }
-        precondition(headphones.refreshes == 2, "Ready legacy controls redundantly refreshed unrelated settings")
+        precondition(headphones.refreshes == 1, "Ready legacy controls redundantly refreshed unrelated settings")
         headphones.receiveStatus()
         try await Task.sleep(for: .milliseconds(120))
         precondition(controller.controlSession == nil && !output.ready,
@@ -465,6 +471,11 @@ enum Check {
         modernRaw.emit(.handoffReady)
         try await waitUntil { modernRaw.handoffs == 1 }
         modernRaw.emit(.active(LDACFormat()))
+        try await waitUntil { modernDevice.settingsRefreshes == 1 || modernDevice.refreshes != 0 }
+        precondition(modernDevice.settingsRefreshes == 1 && modernDevice.refreshes == 0,
+                     "Ready modern controls used destructive full refresh")
+        modernDevice.receiveStatus()
+        modernDevice.receiveVolume()
         try await waitUntil { modernDevice.queuedWrite != nil }
         precondition(modernDevice.volumeRefreshes == 0 && !modernOutput.ready)
         modernDevice.transmitVolume()
@@ -530,6 +541,9 @@ enum Check {
                              "Device return replaced the user's subsequently selected output")
                 cased.audioRoute?.route = Route(uid: "fixture-headphones")
                 cased.resumeIfReady()
+                try await waitUntil { !casedDevice.statusFresh && !casedDevice.volumeFresh }
+                casedDevice.receiveStatus()
+                casedDevice.receiveVolume()
                 try await waitUntil { cased.session != nil }
                 try await stop(cased)
             }
@@ -551,6 +565,9 @@ enum Check {
         precondition(resuming.session == nil && resuming.recoveryTask == nil && returning.connectionRequests.isEmpty)
         returning.isDeviceConnected = true
         resuming.resumeIfReady()
+        try await waitUntil { !returning.statusFresh && !returning.volumeFresh }
+        returning.receiveStatus()
+        returning.receiveVolume()
         try await waitUntil { resuming.session != nil }
         let resumedSession = resuming.session!
         precondition(resumedSession !== oldSession && resuming.headphones === returning)
@@ -597,6 +614,9 @@ enum Check {
         sourceDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:02")
         sourceDevice.localSource = true
         otherSource.resumeIfReady()
+        try await waitUntil { !sourceDevice.statusFresh && !sourceDevice.volumeFresh }
+        sourceDevice.receiveStatus()
+        sourceDevice.receiveVolume()
         try await waitUntil { otherSource.session != nil }
         try await stop(otherSource)
         print("PASS actual completion routing: manual Off never reconnects absent headphones; another multipoint source holds resume until the Mac is confirmed")
@@ -656,6 +676,9 @@ enum Check {
             precondition(bounded.session == nil, "Device return bypassed the selected Mac output")
             bounded.audioRoute?.route = Route(uid: "fixture-headphones")
             bounded.resumeIfReady()
+            try await waitUntil { !recoveringDevice.statusFresh && !recoveringDevice.volumeFresh }
+            recoveringDevice.receiveStatus()
+            recoveringDevice.receiveVolume()
             try await waitUntil { bounded.session != nil }
             precondition(bounded.recoveryAttempt == 0 && !bounded.recoveryPaused,
                          "An observed device disconnect and return did not renew bounded recovery")
@@ -689,6 +712,11 @@ with tempfile.TemporaryDirectory(prefix="acouplet-ldac-controller-volume-") as d
     subprocess.run([str(binary)], env=environment, check=True)
     if "--check-mutations" in sys.argv:
         mutations = [
+            ("modern settings refresh", "headphones?.requestCurrentSettings()", "headphones?.refresh()",
+             "Ready modern controls used destructive full refresh"),
+            ("targeted startup refresh", "if IOBluetoothDevice(addressString: address)?.isClassicConnected() == true { headphones.refreshMusicVolume() }",
+             "if IOBluetoothDevice(addressString: address)?.isClassicConnected() == true { headphones.refresh() }",
+             "LDAC startup refreshed unrelated settings or admitted stale volume"),
             ("raw", "hasMusicVolumeForHandoff && (headphones?.playback.generation != .v1 || transportFormat != nil)",
              "hasMusicVolumeForHandoff", "Legacy raw ownership admitted before active"),
             ("status", "&& headphones.musicStatusReadbackID != nil && headphones.musicStatusReadbackID != initialStatusReadbackID",

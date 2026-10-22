@@ -58,7 +58,7 @@ static void RunLoopFor(NSTimeInterval seconds) {
 }
 
 static double MonotonicTime(void) {
-    return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000000000.0;
+    return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000.0;
 }
 
 static const char *RefreshOwnedPeer(CBClassicPeer *peer, CBClassicManager *manager) {
@@ -91,12 +91,14 @@ typedef struct {
     double wall[SenderStageCount];
     double cpu[SenderStageCount];
     double maximumPacing;
+    double maximumStageDuration;
 } SenderTiming;
 
 static void RecordSenderStage(SenderTiming *timing, int stage) {
     double wall = MonotonicTime();
     double cpu = (double)clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) / 1000000000.0;
     double duration = wall - timing->wallAt;
+    timing->maximumStageDuration = fmax(timing->maximumStageDuration, duration);
     timing->wall[timing->stage] += duration;
     timing->cpu[timing->stage] += cpu - timing->cpuAt;
     if (timing->stage == SenderPacing) timing->maximumPacing = fmax(timing->maximumPacing, duration);
@@ -698,10 +700,11 @@ static BOOL SelfTest(void) {
             if (self.failed) return;
             available = self.profile.capacityBytes - self.pcmBytes;
         }
+        if (!available && !self.pcmComplete) return;
         NSUInteger tail = (self.pcmHead + self.pcmBytes) % self.profile.capacityBytes;
         NSUInteger maximum = MIN(available, self.profile.capacityBytes - tail);
         uint8_t *destination = self.pcmRing + tail;
-        if (self.pcmComplete || !available) { destination = discarded; maximum = self.pcmComplete ? sizeof(discarded) : 1; }
+        if (self.pcmComplete) { destination = discarded; maximum = sizeof(discarded); }
         ssize_t count = read(self.pcmFD, destination, maximum);
         if (count < 0 && errno == EINTR) continue;
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
@@ -718,11 +721,6 @@ static BOOL SelfTest(void) {
         }
         self.pcmReadBytes += (uint64_t)count;
         if (self.pcmComplete) { self.pcmDiscardedBytes += (uint64_t)count; continue; }
-        if (!available) {
-            printf("PCM_FAILED reason=ring-overflow capacityFrames=%lu readBytes=%llu\n", self.profile.capacityBytes / 8, self.pcmReadBytes);
-            self.failed = YES;
-            return;
-        }
         self.pcmBytes += (NSUInteger)count;
         if (!self.pcmReady && self.pcmBytes >= self.profile.prefillBytes) {
             self.pcmReady = YES;
@@ -1136,6 +1134,9 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         probe.degradation = (DegradationState){.windowEnd = started + 1};
         double deadline = continuous ? INFINITY : started + seconds + 1;
         double nextProgress = started + 1;
+        NSUInteger intervalPackets = 0, intervalWaits = 0;
+        double intervalService = 0, maximumService = 0, maximumSend = 0;
+        double maximumWait = 0, maximumLocalStall = 0, maximumDebt = 0;
         double lastPollAt = initialPollAt;
         int lastPollCount = 1;
         unsigned int lastPollFlags = event.flags;
@@ -1331,6 +1332,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 break;
             }
 #endif
+            RecordSenderStage(&timing, SenderOther);
             double beforeSend = MonotonicTime();
             ssize_t sent = send(fd, packet, packetLength, 0);
             double afterSend = MonotonicTime();
@@ -1349,20 +1351,27 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             BOOL drained = NO;
             BOOL drainBreached = NO;
             double lastDrainObservation = afterSend;
-            double maximumSchedulerGap = 0;
+            double maximumSchedulerGap = fmax(afterSend - beforeSend, timing.maximumStageDuration);
             double maximumPollDuration = 0;
             NSUInteger drainPolls = 0;
             while (!probe.closed && !probe.failed && !probe.inputEnded && owned.socketFD == fd) {
+                PollLiveControls(probe);
+                [probe pollInput];
+                [probe pollPCM];
+                RunLoopFor(0);
+                if (probe.closed || probe.failed || probe.inputEnded || owned.socketFD != fd) break;
                 if (continuous && !probe.stopRequested && !finishing && [probe checkDegradation]) break;
                 double pollAt = MonotonicTime();
                 maximumSchedulerGap = fmax(maximumSchedulerGap, pollAt - lastDrainObservation);
                 double previousPollAt = lastPollAt;
                 double wakeGap = pollAt - lastPollAt;
-                int count = kevent(queue, NULL, 0, &event, 1, &immediate);
+                struct timespec wait = {0, 2000000};
+                int count = kevent(queue, NULL, 0, &event, 1, &wait);
                 int pollError = count < 0 ? errno : 0;
                 now = MonotonicTime();
                 drainPolls++;
                 maximumPollDuration = fmax(maximumPollDuration, now - pollAt);
+                maximumSchedulerGap = fmax(maximumSchedulerGap, now - pollAt - 0.002);
                 lastDrainObservation = now;
                 double drainDuration = now - afterSend;
                 if (drainDuration >= 0.1 && !drainBreached) {
@@ -1379,12 +1388,12 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 lastPollCount = count;
                 lastPollFlags = count > 0 ? event.flags : 0;
                 lastPollData = count > 0 ? (long)event.data : 0;
-                if (count < 0 || (count && event.flags & (EV_ERROR | EV_EOF))) {
+                if ((count < 0 && pollError != EINTR) || (count > 0 && event.flags & (EV_ERROR | EV_EOF))) {
                     printf("DRAIN_ERROR packet=%lu count=%d flags=%04X data=%ld errno=%d\n",
                            sentPackets - 1, count, lastPollFlags, lastPollData, pollError);
                     break;
                 }
-                if (count) {
+                if (count > 0) {
                     if (!continuous) printf("DRAIN packet=%lu writable=%ld baseline=%d elapsed=%.6f duration=%.6f flags=%04X wakeGap=%.6f polls=%lu maxGap=%.6f maxPollDuration=%.6f\n",
                            sentPackets - 1, (long)event.data, baseline, now - started, drainDuration, event.flags,
                            wakeGap, drainPolls, maximumSchedulerGap, maximumPollDuration);
@@ -1400,13 +1409,17 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                                      drainPolls, maximumSchedulerGap, maximumPollDuration);
                     break;
                 }
-                if (count) break;
-                PollLiveControls(probe);
-                [probe pollInput];
-                [probe pollPCM];
-                RunLoopFor(0.001);
+                if (count > 0) break;
             }
             if (drained) {
+                intervalPackets++;
+                intervalWaits += drainPolls;
+                intervalService += now - beforeSend;
+                maximumService = fmax(maximumService, now - beforeSend);
+                maximumSend = fmax(maximumSend, afterSend - beforeSend);
+                maximumWait = fmax(maximumWait, maximumPollDuration);
+                maximumLocalStall = fmax(maximumLocalStall, maximumSchedulerGap);
+                maximumDebt = fmax(maximumDebt, now - PacketDue(started, sentRTPSamples, profile));
                 timing = NewSenderTiming();
                 drainedPackets++;
                 drainedSamples = sentSamples;
@@ -1425,6 +1438,12 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                            sentPackets, drainedPackets, sourceSamples, sentSamples, drainedSamples, probe.pcmBytes / 8,
                            lateness, now - started, !recovery.breached && !probe.pcmSkippedBytes, probe.pcmSkippedBytes / 8,
                            sentRTPSamples);
+                    printf("SENDER_TIMING packets=%lu waits=%lu serviceMean=%.6f serviceMax=%.6f sendMax=%.6f waitMax=%.6f localStallMax=%.6f debtMax=%.6f debt=%.6f clock=uptime-raw\n",
+                           intervalPackets, intervalWaits, intervalService / intervalPackets, maximumService,
+                           maximumSend, maximumWait, maximumLocalStall, maximumDebt,
+                           fmax(0, now - PacketDue(started, sentRTPSamples, profile)));
+                    intervalPackets = intervalWaits = 0;
+                    intervalService = maximumService = maximumSend = maximumWait = maximumLocalStall = maximumDebt = 0;
                     nextProgress = now + 1;
                 }
                 if (profile.adaptive && !finishing && !probe.stopRequested) {

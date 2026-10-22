@@ -4,6 +4,10 @@ import Foundation
 @main
 enum LDACSessionDiagnosticsCheck {
     static func main() throws {
+        let timing = "serviceMean=0.004000 serviceMax=0.006000 sendMax=0.000020 waitMax=0.002100 localStallMax=0.000100 debtMax=0.025000 debt=0.021000"
+        precondition(LDACNativeSession.senderTimingSummary("SENDER_TIMING packets=180 waits=250 \(timing) clock=uptime-raw") == timing)
+        precondition(LDACNativeSession.senderTimingSummary("SENDER_TIMING \(timing)") == nil)
+        precondition(LDACNativeSession.senderTimingSummary("SENDER_TIMING packets=180 waits=250 \(timing) clock=uptime-raw private-data") == nil)
         if CommandLine.arguments.count == 3, ["--live", "--finish"].contains(CommandLine.arguments[1]) {
             let directory = URL(fileURLWithPath: CommandLine.arguments[2])
             let active = try LDACNativeSession.beginDiagnostics(in: directory)

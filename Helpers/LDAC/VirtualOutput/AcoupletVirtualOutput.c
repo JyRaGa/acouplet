@@ -11,7 +11,7 @@
 #include "NullAudio.c"
 
 enum { kAcoupletLease = 'xmls', kAcoupletModel = 'xmnm', kAcoupletPriority = 'xmpr', kAcoupletRevision = 'xmvr' };
-static const SInt32 kAcoupletDriverRevision = 5;
+static const SInt32 kAcoupletDriverRevision = 6;
 static UInt64 gLeaseDeadline;
 static pid_t gLeaseOwner;
 static atomic_bool gAvailable;
@@ -176,25 +176,25 @@ static void AcoupletPriorityUncertain(CFStringRef error) {
     gPriorityWaiting = -1;
     gPriorityDeadline = 0;
     gPriorityStopping = true;
-    AcoupletPriorityPhase(CFSTR("cleanup-required"), error);
+    AcoupletPriorityPhase(gPrioritySent ? CFSTR("cleanup-required") : CFSTR("preparation-failed"), error);
 }
 
 static Boolean AcoupletPriorityExpire(void) {
     if (!gPriorityDeadline || mach_absolute_time() < gPriorityDeadline) return false;
     if (gPrioritySent) gPriorityPublicationLost = true;
     AcoupletPriorityClose();
-    AcoupletPriorityUncertain(CFSTR("Bluetooth configuration deadline expired; cleanup is uncertain."));
+    AcoupletPriorityUncertain(CFSTR("Bluetooth configuration deadline expired."));
     return true;
 }
 
 static void AcoupletPriorityIdle(void) {
     AcoupletPriorityClose();
-    gPrioritySent = false;
     gPriorityEnabling = false;
     gPriorityStopping = false;
     gPriorityDisconnected = false;
     gPriorityPublicationLost = false;
     pthread_mutex_lock(&gPlugIn_StateMutex);
+    gPrioritySent = false;
     if (gPriorityAddress) CFRelease(gPriorityAddress);
     gPriorityAddress = NULL;
     gPriorityOwner = 0;
@@ -206,6 +206,7 @@ static void AcoupletPriorityIdle(void) {
 static int64_t gPriorityCheckStatus = -1;
 static UInt64 gPriorityCheckSends;
 static UInt64 gPriorityCheckBootstraps;
+static void AcoupletPriorityCheckBootstrap(xpc_object_t request);
 #endif
 
 static Boolean AcoupletPrioritySend(int64_t status) {
@@ -214,7 +215,7 @@ static Boolean AcoupletPrioritySend(int64_t status) {
 #ifndef ACOUPLET_PRIORITY_CHECK
     if (!gPriorityConnection || gPriorityNotify < 0 ||
         notify_check(gPriorityNotify, &pending) != NOTIFY_STATUS_OK) {
-        AcoupletPriorityUncertain(CFSTR("Priority notification unavailable; cleanup is uncertain."));
+        AcoupletPriorityUncertain(CFSTR("Priority notification unavailable."));
         return false;
     }
 #else
@@ -232,7 +233,11 @@ static Boolean AcoupletPrioritySend(int64_t status) {
     xpc_release(request);
     gPriorityWaiting = status;
     if (!gPriorityDeadline) gPriorityDeadline = mach_absolute_time() + (UInt64)(gTicksPerSecond * 40);
-    if (status == 2) gPrioritySent = true;
+    if (status == 2) {
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        gPrioritySent = true;
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+    }
     return true;
 }
 
@@ -279,7 +284,11 @@ static void AcoupletPriorityEvent(xpc_object_t event) {
         free(gPriorityRetiredUID);
         gPriorityRetiredUID = NULL;
         gPriorityPublicationWithdrawn = false;
-        AcoupletPriorityUncertain(CFSTR("Audio-host connection was interrupted; cleanup is uncertain."));
+        AcoupletPriorityUncertain(event == XPC_ERROR_CONNECTION_INTERRUPTED
+            ? CFSTR("Audio-host connection was interrupted.")
+            : event == XPC_ERROR_CONNECTION_INVALID
+                ? CFSTR("Audio-host connection was invalidated.")
+                : CFSTR("Audio-host connection failed."));
         return;
     }
     if (xpc_get_type(event) != XPC_TYPE_DICTIONARY) return;
@@ -369,10 +378,11 @@ static void AcoupletPriorityStart(void) {
 #endif
     gPriorityListening = true;
     xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(request, "kBTAudioMsgDeviceUid", "");
 #ifndef ACOUPLET_PRIORITY_CHECK
     xpc_connection_send_message(gPriorityConnection, request);
 #else
-    assert(xpc_dictionary_get_count(request) == 0);
+    AcoupletPriorityCheckBootstrap(request);
     ++gPriorityCheckBootstraps;
 #endif
     xpc_release(request);
@@ -383,7 +393,7 @@ static void AcoupletPriorityTick(void) {
     if (gPriorityWaiting >= 0 && gPriorityNotify >= 0) {
         int changed = 0;
         if (notify_check(gPriorityNotify, &changed) != NOTIFY_STATUS_OK)
-            AcoupletPriorityUncertain(CFSTR("Bluetooth notification observation failed; cleanup is uncertain."));
+            AcoupletPriorityUncertain(CFSTR("Bluetooth notification observation failed."));
         else if (changed) AcoupletPriorityNotification();
     }
     pthread_mutex_lock(&gPlugIn_StateMutex);
@@ -857,6 +867,7 @@ static OSStatus AcoupletGetData(AudioServerPlugInDriverRef driver, AudioObjectID
                 if (authorized && client == gLeaseOwner && AcoupletLeaseValid()) {
                     if (gPriorityAddress) CFDictionarySetValue(result, CFSTR("address"), gPriorityAddress);
                     if (gPriorityError) CFDictionarySetValue(result, CFSTR("error"), gPriorityError);
+                    CFDictionarySetValue(result, CFSTR("prioritySent"), gPrioritySent ? kCFBooleanTrue : kCFBooleanFalse);
                 }
                 pthread_mutex_unlock(&gPlugIn_StateMutex);
                 *(CFPropertyListRef *)data = result;

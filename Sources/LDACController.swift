@@ -418,7 +418,7 @@ final class LDACController: ObservableObject {
                 try await output.priorityControl()
                 try Task.checkCancellation()
                 let previousReadback = headphones.musicVolumeReadbackID
-                if IOBluetoothDevice(addressString: address)?.isClassicConnected() == true { headphones.refresh() }
+                if IOBluetoothDevice(addressString: address)?.isClassicConnected() == true { headphones.refreshMusicVolume() }
                 self.record("initial-volume-wait", reason: self.musicControlStatus)
                 let deadline = Date().addingTimeInterval(15)
                 while !self.hasMusicVolumeForHandoff || !headphones.hasFreshMusicVolumeReadback || headphones.musicVolumeReadbackID == previousReadback {
@@ -777,8 +777,10 @@ final class LDACController: ObservableObject {
 
     private func waitForControls(_ address: String) {
         let identifier = sessionID
-        if (headphones?.playback.generation != .v1 || headphones?.isReady != true),
-           IOBluetoothDevice(addressString: address)?.isClassicConnected() == true { headphones?.refresh() }
+        if IOBluetoothDevice(addressString: address)?.isClassicConnected() == true {
+            if headphones?.isReady != true { headphones?.refresh() }
+            else if headphones?.playback.generation != .v1 { headphones?.requestCurrentSettings() }
+        }
         readinessTask = Task { [weak self] in
             guard let self else { return }
             let deadline = Date().addingTimeInterval(30)
@@ -1096,7 +1098,7 @@ final class LDACController: ObservableObject {
             } else {
                 connectionRestoreError = await self.restoreConnectionMode()
             }
-            self.record("restored", reason: restoreError ?? "routes restored and output lease released")
+            self.record("restored", reason: restoreError ?? "native output cleanup completed and output lease released")
             self.nativeOutput = nil
             self.outputID = nil
             self.headphones = nil

@@ -68,6 +68,34 @@ final class SonyBLEIdentityTests: XCTestCase {
         XCTAssertEqual(SonyBLEIdentity.savedDevices(in: defaults), [updated.classicAddress: updated, second.classicAddress: second])
     }
 
+    func testLegacyPeripheralIdentifierRemainsCanonicalWithoutALearnedBLEEndpoint() throws {
+        let canonical = UUID()
+        let record = ["classicAddress": "12:34:56:78:9A:BC", "model": "wfXM5", "hash": "1234ABCD",
+                      "peripheralIdentifier": canonical.uuidString]
+        let identity = try XCTUnwrap(SonyBLEIdentity.VerifiedDevice(propertyList: record))
+        XCTAssertEqual(identity.peripheralIdentifier, canonical)
+        XCTAssertNil(identity.blePeripheralIdentifier)
+        XCTAssertEqual(identity.propertyList, record)
+    }
+
+    func testLearnedBLEEndpointRoundTripsIndependentlyOfCanonicalAssociation() throws {
+        let canonical = UUID()
+        let endpoint = UUID()
+        let identity = try XCTUnwrap(SonyBLEIdentity.VerifiedDevice(classicAddress: "12:34:56:78:9A:BC", model: .wfXM5,
+            hash: "1234ABCD", peripheralIdentifier: canonical, blePeripheralIdentifier: endpoint))
+        let restored = try XCTUnwrap(SonyBLEIdentity.VerifiedDevice(propertyList: identity.propertyList))
+        XCTAssertEqual(restored, identity)
+        XCTAssertEqual(restored.peripheralIdentifier, canonical)
+        XCTAssertEqual(restored.blePeripheralIdentifier, endpoint)
+        XCTAssertTrue(restored.matches(classicAddress: identity.classicAddress, model: .wfXM5,
+            peripheralIdentifier: canonical, isPaired: true))
+        XCTAssertFalse(restored.matches(classicAddress: identity.classicAddress, model: .wfXM5,
+            peripheralIdentifier: endpoint, isPaired: true))
+        var malformed = identity.propertyList
+        malformed["blePeripheralIdentifier"] = "invalid"
+        XCTAssertNil(SonyBLEIdentity.VerifiedDevice(propertyList: malformed))
+    }
+
     func testIdentityMapRejectsMismatchedAddressKeysAndInvalidRecords() throws {
         let suite = "dev.baglayan.Acouplet.identity-map-tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

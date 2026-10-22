@@ -39,14 +39,17 @@ enum SonyBLEIdentity {
         let model: SonyDeviceModel
         let hash: String
         let peripheralIdentifier: UUID?
+        let blePeripheralIdentifier: UUID?
 
-        init?(classicAddress: String, model: SonyDeviceModel, hash: String, peripheralIdentifier: UUID?) {
+        init?(classicAddress: String, model: SonyDeviceModel, hash: String, peripheralIdentifier: UUID?,
+              blePeripheralIdentifier: UUID? = nil) {
             guard let address = normalizedAddress(classicAddress), model != .unknown,
                   hash.utf8.count == 8, hash.utf8.allSatisfy(isHexDigit) else { return nil }
             self.classicAddress = address
             self.model = model
             self.hash = hash.uppercased()
             self.peripheralIdentifier = peripheralIdentifier
+            self.blePeripheralIdentifier = blePeripheralIdentifier
         }
 
         init?(propertyList: [String: Any]) {
@@ -59,12 +62,19 @@ enum SonyBLEIdentity {
                 guard let rawIdentifier = value as? String, let parsed = UUID(uuidString: rawIdentifier) else { return nil }
                 identifier = parsed
             }
-            self.init(classicAddress: address, model: model, hash: hash, peripheralIdentifier: identifier)
+            var bleIdentifier: UUID?
+            if let value = propertyList["blePeripheralIdentifier"] {
+                guard let rawIdentifier = value as? String, let parsed = UUID(uuidString: rawIdentifier) else { return nil }
+                bleIdentifier = parsed
+            }
+            self.init(classicAddress: address, model: model, hash: hash, peripheralIdentifier: identifier,
+                      blePeripheralIdentifier: bleIdentifier)
         }
 
         var propertyList: [String: String] {
             var values = ["classicAddress": classicAddress, "model": model.rawValue, "hash": hash]
             values["peripheralIdentifier"] = peripheralIdentifier?.uuidString
+            values["blePeripheralIdentifier"] = blePeripheralIdentifier?.uuidString
             return values
         }
 

@@ -29,10 +29,11 @@ final class FastPairTransportTests: XCTestCase {
         XCTAssertNotNil(retainedDelegate)
         XCTAssertNil(retiredOwner)
         XCTAssertNil(retainedDelegate?.owner)
-        XCTAssertNil(retainedDelegate?.channel)
+        XCTAssertTrue(retainedDelegate?.channel === channel)
+        XCTAssertNotNil(retainedDelegate?.channelIO)
         let replacement = FastPairTransport.ChannelDelegate(owner: replacementOwner, session: UUID())
         retainedDelegate?.didOpen(channel, status: kIOReturnSuccess)
-        retainedDelegate?.didClose(channel)
+        retainedDelegate?.retire(completion: closeCompletion)
         let callbacksDrained = expectation(description: "Stale callbacks drained")
         DispatchQueue.main.async { callbacksDrained.fulfill() }
         await fulfillment(of: [callbacksDrained], timeout: 2)
@@ -45,13 +46,14 @@ final class FastPairTransportTests: XCTestCase {
         XCTAssertEqual(failures, 0)
         release.signal()
         await fulfillment(of: [finished], timeout: 2)
-        for _ in 0..<100 where retainedDelegate != nil {
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        XCTAssertNil(retainedDelegate)
-        let reopened = expectation(description: "Pending open resumed after native close")
+        XCTAssertNotNil(retainedDelegate)
+        XCTAssertEqual(closeCompletion.wait(timeout: .now()), .timedOut)
+        XCTAssertEqual(failures, 0)
+        let reopened = expectation(description: "Pending open resumed after terminal close")
         closeCompletion.notify(queue: .main) { reopened.fulfill() }
+        retainedDelegate?.didClose(channel)
         await fulfillment(of: [reopened], timeout: 2)
+        XCTAssertNil(retainedDelegate)
         XCTAssertEqual(failures, 1)
     }
 
@@ -76,6 +78,8 @@ final class FastPairTransportTests: XCTestCase {
         await fulfillment(of: [waiting], timeout: 2)
         XCTAssertEqual(failures, 0)
         owner.close()
+        delegate.didClose(channel)
+        XCTAssertEqual(owner.closeCompletion.wait(timeout: .now()), .timedOut)
         release.signal()
         await fulfillment(of: [finished], timeout: 2)
         let closed = expectation(description: "Native cleanup completed")
@@ -115,10 +119,90 @@ final class FastPairTransportTests: XCTestCase {
         XCTAssertEqual(failures, 1)
         release.signal()
         await fulfillment(of: [finished], timeout: 2)
+        XCTAssertEqual(owner.closeCompletion.wait(timeout: .now()), .timedOut)
+        delegate.didClose(channel)
         let closed = expectation(description: "Native cleanup completed")
         owner.closeCompletion.notify(queue: .main) { closed.fulfill() }
         await fulfillment(of: [closed], timeout: 2)
         XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
+    func testFailedOpenFinishesRetirementWithoutCloseCallback() async {
+        let closeReturned = expectation(description: "Native close returned")
+        let closed = expectation(description: "Failed opening channel retired")
+        let channel = RFCOMMChannelIOTests.TestChannel(onClose: { closeReturned.fulfill() })
+        let owner = FastPairTransport(onOpen: { XCTFail("Failed channel opened") }, onData: { _ in },
+                                      onFailure: { _ in XCTFail("Retired transport failed") })
+        var delegate: FastPairTransport.ChannelDelegate? = .init(owner: owner, session: UUID())
+        delegate?.channel = channel
+        delegate?.channelIO = RFCOMMChannelIO(channel: channel, opening: true)
+        weak var retainedDelegate = delegate
+        delegate?.retire(completion: owner.closeCompletion)
+        delegate = nil
+        await fulfillment(of: [closeReturned], timeout: 2)
+        XCTAssertEqual(owner.closeCompletion.wait(timeout: .now()), .timedOut)
+        owner.closeCompletion.notify(queue: .main) { closed.fulfill() }
+        retainedDelegate?.didOpen(channel, status: kIOReturnError)
+        await fulfillment(of: [closed], timeout: 2)
+        XCTAssertNil(retainedDelegate)
+        XCTAssertEqual(channel.closeCount, 1)
+    }
+
+    @MainActor
+    func testRetiredOpeningChannelClosesLateSuccessAndWaitsForMatchingTerminalCallback() async {
+        let started = expectation(description: "Both native close calls started")
+        started.expectedFulfillmentCount = 2
+        let finished = expectation(description: "Both native close calls returned")
+        finished.expectedFulfillmentCount = 2
+        let closed = expectation(description: "Late opening channel retired")
+        let release = DispatchSemaphore(value: 0)
+        let channel = DelayedChannel(started: started, finished: finished, release: release)
+        let owner = FastPairTransport(onOpen: { XCTFail("Retired channel opened") }, onData: { _ in },
+                                      onFailure: { _ in XCTFail("Retired transport failed") })
+        var delegate: FastPairTransport.ChannelDelegate? = .init(owner: owner, session: UUID())
+        delegate?.channel = channel
+        delegate?.channelIO = RFCOMMChannelIO(channel: channel, opening: true)
+        weak var retainedDelegate = delegate
+        delegate?.retire(completion: owner.closeCompletion)
+        delegate = nil
+        let unrelatedChannel = RFCOMMChannelIOTests.TestChannel()
+        retainedDelegate?.didOpen(unrelatedChannel, status: kIOReturnError)
+        retainedDelegate?.didOpen(channel, status: kIOReturnSuccess)
+        await fulfillment(of: [started], timeout: 2)
+        release.signal()
+        release.signal()
+        await fulfillment(of: [finished], timeout: 2)
+        retainedDelegate?.didClose(unrelatedChannel)
+        XCTAssertEqual(owner.closeCompletion.wait(timeout: .now()), .timedOut)
+        XCTAssertTrue(retainedDelegate?.channel === channel)
+        XCTAssertNotNil(retainedDelegate?.channelIO)
+        owner.closeCompletion.notify(queue: .main) { closed.fulfill() }
+        retainedDelegate?.didClose(channel)
+        await fulfillment(of: [closed], timeout: 2)
+        XCTAssertNil(retainedDelegate)
+    }
+
+    @MainActor
+    func testRetirementReleasesChannelOffMainBeforeCompleting() async {
+        let released = expectation(description: "Retired channel released")
+        let closed = expectation(description: "Retirement completed")
+        var channel: RFCOMMChannelIOTests.TestChannel? = .init(onDeinit: {
+            XCTAssertFalse(Thread.isMainThread)
+            released.fulfill()
+        })
+        let owner = FastPairTransport(onOpen: {}, onData: { _ in },
+                                      onFailure: { _ in XCTFail("Retired transport failed") })
+        let delegate = FastPairTransport.ChannelDelegate(owner: owner, session: UUID())
+        delegate.channel = channel
+        delegate.channelIO = RFCOMMChannelIO(channel: channel!)
+        delegate.retire(completion: owner.closeCompletion)
+        channel = nil
+        delegate.didClose(delegate.channel!)
+        owner.closeCompletion.notify(queue: .main) { closed.fulfill() }
+        await fulfillment(of: [released, closed], timeout: 2)
+        XCTAssertNil(delegate.channel)
+        XCTAssertNil(delegate.channelIO)
     }
 
     @MainActor
@@ -127,7 +211,7 @@ final class FastPairTransportTests: XCTestCase {
         let owner = FastPairTransport(onOpen: { openings += 1 }, onData: { _ in },
                                       onFailure: { _ in XCTFail("Healthy reuse failed") })
         let channel = RFCOMMChannelIOTests.TestChannel()
-        owner.simulateConnection(address: "test", device: ConnectedDevice(), channel: channel)
+        let delegate = owner.simulateConnection(address: "test", device: ConnectedDevice(), channel: channel)
         XCTAssertTrue(owner.canReuse(address: "test"))
         owner.open(address: "test")
         owner.open(address: "test")
@@ -140,7 +224,8 @@ final class FastPairTransportTests: XCTestCase {
         owner.open(address: "test")
         owner.close()
         let cancelled = expectation(description: "Cancelled reuse notification drained")
-        DispatchQueue.main.async { cancelled.fulfill() }
+        delegate.didClose(channel)
+        owner.closeCompletion.notify(queue: .main) { cancelled.fulfill() }
         await fulfillment(of: [cancelled], timeout: 2)
         XCTAssertEqual(openings, 1)
     }

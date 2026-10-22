@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix='acouplet-ldac-build-check-') as directo
     driver = app / 'Helpers/AcoupletLDACOutput.driver'
     driver_info = plistlib.loads((driver / 'Contents/Info.plist').read_bytes())
     assert driver_info['CFBundleIdentifier'] == 'dev.baglayan.Acouplet.LDACOutput'
-    assert driver_info['AcoupletLDACDriverRevision'] == 5
+    assert driver_info['AcoupletLDACDriverRevision'] == 6
     assert driver_info['CFBundleVersion'] == '245' and driver_info['CFBundleExecutable'] == 'AcoupletVirtualOutput'
     assert driver_info['AudioServerPlugIn_MachServices'] == ['com.apple.BTAudioHALPlugin.xpc']
     for name in ('NullAudio.c', 'LICENSE.txt'):

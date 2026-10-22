@@ -1571,10 +1571,33 @@ final class SonyInitialHandshakeTests: XCTestCase {
         XCTAssertEqual(saved.model, .wfXM5)
         XCTAssertEqual(saved.hash, "ABCDEF12")
         XCTAssertEqual(saved.peripheralIdentifier, identifier)
+        XCTAssertEqual(saved.blePeripheralIdentifier, identifier)
         XCTAssertEqual(SonyBLEIdentity.savedDevices(in: defaults)[saved.classicAddress], saved)
         deliver([0x11, 0x04] + Array("00:11:22:33:44:5500000000".utf8), to: controller)
         XCTAssertEqual(controller.simulatedSavedIdentity, saved)
         XCTAssertTrue(controller.isReady)
+    }
+
+    @MainActor
+    func testVerifiedBLEEndpointDoesNotBecomeCanonicalWithoutPairedAssociation() throws {
+        let suite = "dev.baglayan.Acouplet.verified-ble-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let endpoint = UUID()
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true, identityDefaults: defaults)
+        defer { controller.simulateControlLoss() }
+        controller.simulateDeviceConnection(named: "WF-1000XM5", controlBusy: true)
+        controller.simulateProtocolMessage([0x01, 0, 3, 0, 0x30, 0x18, 0, 1], beginConnection: true,
+            expectedBLEHash: "ABCDEF12", connectedPeripheralID: endpoint)
+        drain(controller)
+        deliver([0x07, 0, 1, 0x14, 0], to: controller)
+        drain(controller)
+        deliver([0x11, 0x04] + Array("00:11:22:33:44:55ABCDEF12".utf8), to: controller)
+        XCTAssertTrue(controller.isReady)
+        let saved = try XCTUnwrap(controller.simulatedSavedIdentity)
+        XCTAssertNil(saved.peripheralIdentifier)
+        XCTAssertEqual(saved.blePeripheralIdentifier, endpoint)
+        XCTAssertEqual(SonyBLEIdentity.savedDevices(in: defaults)[saved.classicAddress], saved)
     }
 
     @MainActor

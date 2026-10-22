@@ -416,7 +416,7 @@ final class EarbudFinderController: ObservableObject {
         if isSimulated, simulatedTransportIsOpen {
             simulatedTransportIsOpen = false
             simulatedTransportCloseCount += 1
-            simulatedChannelIO?.close {}
+            simulatedChannelIO?.close { _, _ in }
         }
         #endif
         hasOpenedTransport = false

@@ -240,7 +240,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     func nativeBatteryPublication(at date: Date) -> SonyNativeBatteryPublication? {
         guard !isSimulated, isReady, isDeviceConnected, deviceModel == .wfXM5,
               let snapshot = nativeBatterySnapshot, let device, device.isClassicConnected(),
-              let identity = verifiedIdentity(for: device), identity.hash == bluetoothLEHash,
+              let identity = verifiedIdentity(for: device, pairedDevices: pairedDeviceInventory), identity.hash == bluetoothLEHash,
               identity.peripheralIdentifier == snapshot.identifier else { return nil }
         return SonyNativeBatteryPublication(address: address, controlSession: controlSession, snapshot: snapshot, at: date)
     }
@@ -248,7 +248,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     func nativeCaseBatteryPublication(at date: Date) -> SonyNativeCaseBatteryPublication? {
         guard !isSimulated, isReady, isDeviceConnected, deviceModel == .wfXM5,
               let snapshot = nativeBatterySnapshot, let device, device.isClassicConnected(),
-              let identity = verifiedIdentity(for: device), identity.hash == bluetoothLEHash,
+              let identity = verifiedIdentity(for: device, pairedDevices: pairedDeviceInventory), identity.hash == bluetoothLEHash,
               identity.peripheralIdentifier == snapshot.identifier else { return nil }
         return SonyNativeCaseBatteryPublication(address: address, controlSession: controlSession, snapshot: snapshot, at: date)
     }
@@ -315,6 +315,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     @Published private(set) var supportedFunctions2: Set<UInt8> = []
     @Published private(set) var controlChannelID: Int?
     @Published private(set) var usesBluetoothLE = false
+    @Published private(set) var isPreparingBluetoothLE = false
     @Published private(set) var controlPeripheralID: UUID?
     @Published private(set) var bluetoothLEError: String?
     private var bluetoothLEDiagnosticError: String?
@@ -366,11 +367,16 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     var hasOpenControlTransport: Bool {
         #if DEBUG
         if isSimulated { return isReady }
+        if bleTransport?.isReady == true { return true }
         #endif
-        return channel?.isOpen() == true || bleTransport?.isReady == true
+        return channel?.isOpen() == true
     }
     var hasPendingManualBLEConnection: Bool {
-        bleTransport.map { !$0.isReady && !$0.shouldCancelAutomaticConnection } ?? false
+        #if DEBUG
+        isPreparingBluetoothLE || (bleTransport.map { !$0.isReady && !$0.shouldCancelAutomaticConnection } ?? false)
+        #else
+        false
+        #endif
     }
     var isCheckingEarTipFit: Bool { earTipFitTransition?.blocksCommands == true }
     var isPracticingHeadGestures: Bool { headGesturePracticeTransition?.blocksCommands == true }
@@ -763,13 +769,17 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     var pairedDeviceInventory: [any SonyBluetoothDevice]?
     private var channel: (any RFCOMMChannel)?
     private var channelIO: RFCOMMChannelIO?
+    private var retiringChannelIO: [ObjectIdentifier: RFCOMMChannelIO] = [:]
     private var classicWrites: [UInt: ClassicWrite] = [:]
     private var nextClassicWriteID: UInt = 0
     let rfcommCloseCompletion = DispatchGroup()
     private var pendingClassicOpenID: UUID?
     private var classicIncomingData: [(data: Data, transmissionID: UUID?, transmissionOrdinal: UInt64)] = []
     private var classicIncomingDataLength = 0
+    #if DEBUG
     private var bleTransport: SonyBLETransport?
+    private var preparingBLETransport: SonyBLETransport?
+    #endif
     private var expectedBLEIdentity: SonyBLEIdentity.ConnectionTarget?
     private var bluetoothLEIdentityReadOrdinal: UInt64?
     private var controlSession: UInt64 = 0
@@ -1109,10 +1119,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     var simulatedSourceTimeoutPending: Bool { sourceTimeout != nil }
     var simulatedBLEWaitsForConnection: Bool { bleTransport?.shouldCancelAutomaticConnection == true }
     var simulatedBLETransport: SonyBLETransport? { bleTransport }
+    var simulatedPreparingBLETransport: SonyBLETransport? { preparingBLETransport }
     var simulatedRecoveryAddress: String? { transitionAddress }
     var simulatedRecoveryHash: String? { transitionHash }
     var simulatedRecoveryPeripheralID: UUID? { transitionPeripheralID }
     var simulatedSavedIdentity: SonyBLEIdentity.VerifiedDevice? { savedIdentity }
+    var simulatedBLEIdentityTarget: SonyBLEIdentity.ConnectionTarget? { expectedBLEIdentity }
     private(set) var simulatedTransmittedFrames: [SonyFrame] = []
     var defersSimulatedWrites = false
     private var simulatedWriteCompletions: [() -> Void] = []
@@ -1708,10 +1720,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             refresh(shouldOpenLink: true)
             requestCurrentSettings()
         } else {
+            #if DEBUG
             if bleTransport?.shouldCancelAutomaticConnection == true {
                 closeSonyLink()
                 linkState = .disconnected
             }
+            #endif
             retryWorkItem?.cancel()
             retryWorkItem = nil
             nextRetryDate = nil
@@ -1728,14 +1742,18 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
            sourceTransition?.isFinished != false, deviceActionTransition?.isFinished != false,
            pendingChanges.isEmpty, pendingPlaybackCommand == nil, !isEqualizerUpdatePending,
            !isApplyingChange, ambientWorkItem == nil, requestedNoiseControlPayload == nil {
+            #if DEBUG
             let bleTarget = usesBluetoothLE ? expectedBLEIdentity : nil
             let model = deviceModel
+            #endif
             closeSonyLink()
             linkState = .disconnected
+            #if DEBUG
             if let bleTarget {
                 openBluetoothLE(target: bleTarget, model: model)
                 return
             }
+            #endif
         }
         refresh(shouldOpenLink: true, automatically: false)
         requestCurrentSettings()
@@ -1744,7 +1762,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     func retryControlsIfNeeded() -> Bool {
         guard !displayOnly, !isSystemSleeping, isBluetoothInitialized, reconnectAutomatically,
               isDeviceConnected, powerOffState == nil, !isRunningHeadphoneTest,
-              stage == .idle, channel == nil, bleTransport == nil, classicConnectionID == nil,
+              stage == .idle, channel == nil, classicConnectionID == nil,
               serviceDiscoveries.isEmpty, recoveryUsesBLE == nil,
               connectionTransition?.isFinished != false, connectionTransition?.phase != .failed,
               multipointTransition?.isFinished != false,
@@ -1753,6 +1771,9 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
               deviceActionTransition?.isFinished != false, canRecoverDeviceAction,
               nextRetryDate.map({ $0 <= Date() }) ?? true,
               let device, device.isClassicConnected() else { return false }
+        #if DEBUG
+        guard bleTransport == nil, preparingBLETransport == nil else { return false }
+        #endif
         cancelScheduledRetry(resetAttempts: false)
         openSonyLink(automatically: true)
         return true
@@ -1812,7 +1833,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
     }
 
-    private func requestCurrentSettings() {
+    func requestCurrentSettings() {
         guard powerOffState == nil, !isRunningHeadphoneTest, stage == .ready, connectionTransition?.isFinished != false, sourceTransition?.isFinished != false,
               multipointTransition?.isFinished != false, deviceActionTransition?.isFinished != false else { return }
         for (key, read) in discoveryReads where read.transmitted && !read.resolved && !read.retried && read.timeout == nil {
@@ -2289,7 +2310,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         guard canRecoverDeviceAction else { return }
         if let transition = multipointTransition, !transition.isFinished || (transition.phase == .failed && multipointConnection != nil && !isReady) {
             if shouldOpenLink, transition.phase == .recovering, retryWorkItem == nil,
-               channel == nil, bleTransport == nil { scheduleMultipointRecovery() }
+               channel == nil {
+                #if DEBUG
+                guard bleTransport == nil else { return }
+                #endif
+                scheduleMultipointRecovery()
+            }
             return
         }
         guard connectionTransition?.phase != .failed, connectionTransition?.phase != .pairingRequired else { return }
@@ -2297,12 +2323,13 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             if !isDeviceConnected { isDeviceConnected = true }
             return
         }
+        #if DEBUG
+        guard preparingBLETransport == nil else { return }
         if let bleTransport {
             guard !isDeviceConnected, bleTransport.shouldCancelAutomaticConnection,
                   bleTransport.isWaitingForConnection, device?.isClassicConnected() == true else { return }
             closeSonyLink()
         }
-        #if DEBUG
         if isSimulated, pairedDeviceInventory == nil {
             if !isDeviceConnected {
                 finishUnavailableRefresh(.disconnected)
@@ -2349,8 +2376,10 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         if !shouldOpenLink, linkState == .searching { linkState = .disconnected }
         guard isDeviceConnected else {
             if !lastReadyTransportWasBluetoothLE { retryAttempt = 0 }
+            #if DEBUG
             if shouldOpenLink, nextRetryDate.map({ $0 <= Date() }) ?? true,
                openPairedBluetoothLE(for: match, automatically: automatically) { return }
+            #endif
             finishUnavailableRefresh(.disconnected)
             if connectionTransition?.phase == .recovering { scheduleRetry() }
             return
@@ -2764,7 +2793,9 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             }
             return
         }
+        #if DEBUG
         if bleTransport != nil { closeSonyLink() }
+        #endif
         cancelScheduledRetry(resetAttempts: true)
         if connectionTransition?.phase == .recovering || recoveryUsesBLE != nil {
             scheduleRetry()
@@ -2775,32 +2806,32 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             refresh()
             return
         }
+        #if DEBUG
         if !device.isClassicConnected(), openPairedBluetoothLE(for: device) { return }
+        #endif
         openClassicConnection(device, recovering: false)
     }
 
+    #if DEBUG
     func connectBluetoothLE() {
-        guard !displayOnly, !isSystemSleeping else { return }
+        guard !displayOnly, !isSystemSleeping, !hasPendingManualBLEConnection else { return }
         guard clearHeadphoneTestsForExplicitConnection() else { return }
         clearPowerOffForExplicitConnection()
         guard deviceActionTransition?.isFinished != false else { return }
         deviceActionTransition = nil
         guard multipointTransition?.isFinished != false else { return }
-        if let device, openPairedBluetoothLE(for: device, allowPairedBootstrap: true) { return }
+        if let device, openPairedBluetoothLE(for: device, allowPairedBootstrap: true, explicit: true) { return }
         guard let hash = bluetoothLEHash ?? transitionHash else {
             bluetoothLEDiagnosticError = nil
             bluetoothLEError = String(localized: "Connect the headphones in Bluetooth settings, then try again.")
             return
         }
-        #if ACOUPLET_PUBLIC_APIS_ONLY
         let identifier = controlPeripheralID ?? transitionPeripheralID
-        #else
-        let identifier = controlPeripheralID ?? device.flatMap(SonyBLEIdentity.classicPeripheralIdentifier) ?? transitionPeripheralID
-        #endif
-        openBluetoothLE(target: .verified(hash: hash, peripheralIdentifier: identifier), model: deviceModel)
+        openBluetoothLE(target: .verified(hash: hash, peripheralIdentifier: identifier), model: deviceModel, explicit: true)
     }
+    #endif
 
-    private func verifiedIdentity(for device: any SonyBluetoothDevice) -> SonyBLEIdentity.VerifiedDevice? {
+    func verifiedIdentity(for device: any SonyBluetoothDevice, pairedDevices: [any SonyBluetoothDevice]? = nil) -> SonyBLEIdentity.VerifiedDevice? {
         guard let savedIdentity else { return nil }
         #if ACOUPLET_PUBLIC_APIS_ONLY
         let peripheralIdentifier: UUID? = nil
@@ -2808,9 +2839,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         let peripheralIdentifier = SonyBLEIdentity.classicPeripheralIdentifier(for: device)
         #endif
         let advertisedModel = SonyDeviceModel(name: device.name ?? "")
+        let isPaired = pairedDevices?.contains {
+            $0.addressString.flatMap(SonyBLEIdentity.normalizedAddress) == savedIdentity.classicAddress
+        } ?? device.isPaired()
         guard savedIdentity.matches(classicAddress: device.addressString ?? "", model: advertisedModel == .unknown ? savedIdentity.model : advertisedModel,
                                     peripheralIdentifier: peripheralIdentifier,
-                                    isPaired: device.isPaired()) else { return nil }
+                                    isPaired: isPaired) else { return nil }
         return savedIdentity
     }
 
@@ -2819,12 +2853,13 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         return pinnedAddress == nil || pinnedAddress == normalized
     }
 
+    #if DEBUG
     private func openPairedBluetoothLE(for device: any SonyBluetoothDevice, automatically: Bool = false,
-                                      allowPairedBootstrap: Bool = false) -> Bool {
+                                      allowPairedBootstrap: Bool = false, explicit: Bool = false) -> Bool {
         guard connectionTransition?.generation != .v1 else { return false }
         if let identity = verifiedIdentity(for: device) {
-            return openBluetoothLE(target: .verified(hash: identity.hash, peripheralIdentifier: identity.peripheralIdentifier),
-                                   model: identity.model, automatically: automatically)
+            return openBluetoothLE(target: .verified(hash: identity.hash, peripheralIdentifier: identity.blePeripheralIdentifier),
+                                   model: identity.model, automatically: automatically, explicit: explicit)
         }
         #if ACOUPLET_PUBLIC_APIS_ONLY
         return false
@@ -2833,12 +2868,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
               let target = SonyBLEIdentity.ConnectionTarget(pairedAddress: device.addressString ?? "",
             selectedAddress: address, model: deviceModel,
             peripheralIdentifier: SonyBLEIdentity.classicPeripheralIdentifier(for: device), isPaired: device.isPaired()) else { return false }
-        return openBluetoothLE(target: target, model: deviceModel, automatically: automatically)
+        return openBluetoothLE(target: target, model: deviceModel, automatically: automatically, explicit: explicit)
         #endif
     }
 
     @discardableResult
-    private func openBluetoothLE(target: SonyBLEIdentity.ConnectionTarget, model: SonyDeviceModel, automatically: Bool = false) -> Bool {
+    private func openBluetoothLE(target: SonyBLEIdentity.ConnectionTarget, model: SonyDeviceModel, automatically: Bool = false, explicit: Bool = false) -> Bool {
         guard !isSystemSleeping, powerOffState == nil, !isRunningHeadphoneTest,
               connectionTransition?.generation != .v1,
               !automatically || lastReadyTransportWasBluetoothLE || isDeviceConnected else { return false }
@@ -2846,22 +2881,41 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             guard canRecoverDeviceAction else { return false }
             deviceActionRecoveryAttempts += 1
         }
-        closeSonyLink()
-        linkState = .opening
-        lastErrorMessage = nil
-        usesBluetoothLE = true
-        recordDiagnostic("transport=Bluetooth LE; automatic=\(automatically)")
-        bluetoothLEError = nil
-        bluetoothLEDiagnosticError = nil
-        expectedBLEIdentity = target
         let transport = SonyBLETransport(waitForConnection: automatically && reconnectAutomatically && lastReadyTransportWasBluetoothLE
                                          && connectionTransition?.isFinished != false && recoveryUsesBLE == nil
                                          && deviceActionTransition?.phase != .failed
                                          && multipointTransition?.isFinished != false,
-                                         isDeviceConnected: isDeviceConnected)
-        bleTransport = transport
+                                         allowsUnadvertisedGATT: explicit)
+        if explicit, isReady, !usesBluetoothLE {
+            preparingBLETransport = transport
+            isPreparingBluetoothLE = true
+            transport.onPrepared = { [weak self, weak transport] in
+                guard let self, let transport, self.preparingBLETransport === transport else { return }
+                self.preparingBLETransport = nil
+                self.closeSonyLink()
+                self.preparingBLETransport = transport
+                self.isPreparingBluetoothLE = true
+                self.linkState = .opening
+                let promote = { [weak self, weak transport] in
+                    guard let self, let transport, self.preparingBLETransport === transport else { return }
+                    self.preparingBLETransport = nil
+                    self.isPreparingBluetoothLE = false
+                    self.activateBluetoothLE(transport, target: target)
+                    transport.continueSetup()
+                }
+                if self.rfcommCloseCompletion.wait(timeout: .now()) == .success { promote() }
+                else { self.rfcommCloseCompletion.notify(queue: .main) { promote() } }
+            }
+            recordDiagnostic("LE eligibility check; preserving Classic controls")
+        } else {
+            closeSonyLink()
+            activateBluetoothLE(transport, target: target)
+        }
+        recordDiagnostic("transport=Bluetooth LE; automatic=\(automatically); preflight=\(isPreparingBluetoothLE)")
+        bluetoothLEError = nil
+        bluetoothLEDiagnosticError = nil
         transport.onDiagnostic = { [weak self, weak transport] message in
-            guard let self, let transport, self.bleTransport === transport else { return }
+            guard let self, let transport, self.bleTransport === transport || self.preparingBLETransport === transport else { return }
             self.recordDiagnostic(message)
         }
         transport.onReady = { [weak self, weak transport] identifier, name in
@@ -2880,13 +2934,19 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             self.receive(data)
         }
         transport.onDisconnect = { [weak self, weak transport] message in
-            guard let self, let transport, self.bleTransport === transport else { return }
-            self.isDeviceConnected = self.device?.isClassicConnected() ?? false
+            guard let self, let transport, self.bleTransport === transport || self.preparingBLETransport === transport else { return }
+            let wasPreparing = self.preparingBLETransport === transport
+            if wasPreparing {
+                self.preparingBLETransport = nil
+                self.isPreparingBluetoothLE = false
+            } else {
+                self.isDeviceConnected = self.device?.isClassicConnected() ?? false
+            }
             let issue = message ?? String(localized: "The headphone controls disconnected.")
             self.bluetoothLEError = issue
             self.bluetoothLEDiagnosticError = transport.diagnosticError ?? issue
             self.recordDiagnostic("LE disconnected; \(self.bluetoothLEDiagnosticError ?? issue)", failure: true)
-            self.fail(issue)
+            if !wasPreparing || !self.isReady { self.fail(issue) }
         }
         #if DEBUG
         if isSimulated {
@@ -2897,6 +2957,26 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         transport.start(model: model, target: target)
         return true
     }
+
+    private func activateBluetoothLE(_ transport: SonyBLETransport, target: SonyBLEIdentity.ConnectionTarget) {
+        bleTransport = transport
+        expectedBLEIdentity = target
+        usesBluetoothLE = true
+        linkState = .opening
+        lastErrorMessage = nil
+    }
+
+    func cancelBluetoothLEPreparation() {
+        guard let transport = preparingBLETransport else { return }
+        preparingBLETransport = nil
+        isPreparingBluetoothLE = false
+        transport.stop()
+        if !isReady {
+            linkState = .disconnected
+            connect()
+        }
+    }
+    #endif
 
     func setConnectionMode(_ mode: SonyConnectionMode) {
         guard mode != connectionMode else { return }
@@ -2922,9 +3002,6 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         transitionAddress = address
         transitionHash = bluetoothLEHash
         transitionPeripheralID = controlPeripheralID
-        #if !ACOUPLET_PUBLIC_APIS_ONLY
-        transitionPeripheralID = transitionPeripheralID ?? device.flatMap(SonyBLEIdentity.classicPeripheralIdentifier)
-        #endif
         transitionModel = deviceModel
         transitionControlAddresses = controlAddresses
         transitionControlAddresses.insert(Self.normalizedAddress(address))
@@ -3204,9 +3281,13 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 self.retryWorkItem = nil
                 self.nextRetryDate = nil
                 self.retrySecondsRemaining = nil
+                #if DEBUG
                 if connection.usesBLE, let hash = connection.hash {
                     self.openBluetoothLE(target: .verified(hash: hash, peripheralIdentifier: connection.peripheralID), model: connection.model)
-                } else if let target = connection.device, target.isPaired(),
+                    return
+                }
+                #endif
+                if let target = connection.device, target.isPaired(),
                           Self.normalizedAddress(target.addressString ?? "") == Self.normalizedAddress(connection.address) {
                     self.device = target
                     self.address = connection.address
@@ -4679,8 +4760,9 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         cachedServiceOpenIsAutomatic = discoverServices ? automatically : nil
         let (result, openedChannel) = device.openSonyRFCOMMChannel(withChannelID: channelID, delegate: self)
         channel = openedChannel
-        if let openedChannel { channelIO = RFCOMMChannelIO(channel: openedChannel) }
+        if let openedChannel { channelIO = RFCOMMChannelIO(channel: openedChannel, opening: true) }
         guard result == kIOReturnSuccess else {
+            channelIO?.didOpen(status: result)
             handleOpenFailure(result)
             return
         }
@@ -4731,8 +4813,10 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private func sonyServiceUnavailable(on device: any SonyBluetoothDevice, automatically: Bool) {
+        #if DEBUG
         if multipointTransition?.phase != .recovering,
            openPairedBluetoothLE(for: device, automatically: automatically, allowPairedBootstrap: device.isClassicConnected()) { return }
+        #endif
         fail(String(localized: "Could not connect to the headphones’ controls."))
     }
 
@@ -4755,6 +4839,16 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private func closeSonyLink() {
+        #if DEBUG
+        let preparingTransport = preparingBLETransport
+        preparingBLETransport = nil
+        isPreparingBluetoothLE = false
+        preparingTransport?.stop()
+        #endif
+        let closingSession = controlSession
+        if channel != nil {
+            recordDiagnostic("RFCOMM retirement requested; opening=\(linkState == .opening)")
+        }
         lastReceivedSequence = nil
         earbudFinder?.dismiss(retiringTransport: true)
         classicConnectionID = nil
@@ -4798,9 +4892,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         pendingInboundAcknowledgments = 0
         cancelScheduledRetry(resetAttempts: false)
         resetCommandQueue()
+        #if DEBUG
         let closingBLETransport = bleTransport
         bleTransport = nil
         closingBLETransport?.stop()
+        #endif
         usesBluetoothLE = false
         controlPeripheralID = nil
         expectedBLEIdentity = nil
@@ -4815,9 +4911,13 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         classicIncomingDataLength = 0
         for write in classicWrites.values { write.timeout.cancel() }
         if let closingChannel, let closingIO {
+            let identifier = ObjectIdentifier(closingChannel)
+            retiringChannelIO[identifier] = closingIO
             rfcommCloseCompletion.enter()
             let closingWrites = classicWrites.filter { $0.value.channel === closingChannel }
-            let finishClosing: @MainActor @Sendable () -> Void = {
+            let finishClosing: @MainActor @Sendable (IOReturn, IOReturn) -> Void = { delegateStatus, closeStatus in
+                self.retiringChannelIO[identifier] = nil
+                self.recordDiagnostic("RFCOMM retirement completed; retiredSession=\(closingSession); delegateStatus=\(delegateStatus); closeStatus=\(closeStatus)")
                 for identifier in closingWrites.keys { self.classicWrites[identifier] = nil }
                 self.rfcommCloseCompletion.leave()
             }
@@ -4984,9 +5084,15 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         let timeout = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, self.handshakeID == identifier else { return }
-                self.recordDiagnostic("handshake timeout; stage=\(self.stage)", failure: true)
+                if self.linkState == .opening {
+                    self.recordDiagnostic("control transport open timeout; waitingForRetirement=\(self.pendingClassicOpenID != nil)", failure: true)
+                } else {
+                    self.recordDiagnostic("handshake timeout; stage=\(self.stage)", failure: true)
+                }
                 if self.linkState == .opening, self.cachedServiceOpenIsAutomatic != nil {
                     self.handleOpenFailure(kIOReturnTimeout)
+                } else if self.linkState == .opening {
+                    self.fail(String(localized: "Could not connect to the headphones’ controls."))
                 } else {
                     self.fail(String(localized: "The headphones did not respond."))
                 }
@@ -5089,7 +5195,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 || payload == headGesturePracticeTransition?.expectedPayload
                 || legacyOptimizerTransition?.pendingQueries.contains(payload) == true
                 || payload == legacyOptimizerTransition?.expectedPayload)) else { return }
+        #if DEBUG
         guard isSimulated || channel != nil || bleTransport?.isReady == true else { return }
+        #else
+        guard channel != nil else { return }
+        #endif
         if protocolInformation?.generation == .v1 {
             let isEqualizerQuery = equalizer.queryPayloads.contains(payload)
             let isSoundEffectQuery = legacySoundEffectQueryKind(payload) != nil
@@ -6012,6 +6122,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
         #endif
         let data = SonyFrameCodec.encode(type: frame.type, sequence: frame.sequence, payload: frame.payload)
+        #if DEBUG
         if let bleTransport {
             guard bleTransport.write(data, isCurrent: isCurrent, onCancelled: onCancelled, onQueued: onQueued, completion: completion) else {
                 fail(String(localized: "Could not send the command to the headphones. Try again."))
@@ -6019,6 +6130,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             }
             return true
         }
+        #endif
         guard isCurrent?() != false else { onCancelled(); return true }
         guard let channel, let channelIO else { return false }
         guard data.count <= Int(channel.getMTU()), classicWrites.count < 64 else {
@@ -6454,15 +6566,24 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 Self.normalizedAddress($0.addressString ?? "") == address
             }
             #endif
-            let savedPeripheralID = savedIdentity.flatMap { $0.classicAddress == address ? $0.peripheralIdentifier : nil }
+            let previousIdentity = savedIdentity.flatMap { $0.classicAddress == address ? $0 : nil }
+            let pairedPeripheralIdentifier: UUID?
+            if usesBluetoothLE, case .paired(let identifier) = expectedBLEIdentity {
+                pairedPeripheralIdentifier = identifier
+            } else {
+                pairedPeripheralIdentifier = nil
+            }
             #if ACOUPLET_PUBLIC_APIS_ONLY
-            let peripheralIdentifier = controlPeripheralID ?? savedPeripheralID
+            let peripheralIdentifier = pairedPeripheralIdentifier ?? previousIdentity?.peripheralIdentifier
             #else
-            let peripheralIdentifier = primaryDevice.flatMap(SonyBLEIdentity.classicPeripheralIdentifier) ?? controlPeripheralID ?? savedPeripheralID
+            let peripheralIdentifier = primaryDevice.flatMap(SonyBLEIdentity.classicPeripheralIdentifier)
+                ?? pairedPeripheralIdentifier ?? previousIdentity?.peripheralIdentifier
             #endif
+            let blePeripheralIdentifier = usesBluetoothLE ? controlPeripheralID
+                : previousIdentity.flatMap { $0.hash == hash && $0.model == deviceModel ? $0.blePeripheralIdentifier : nil }
             if let identityDefaults, let identity = SonyBLEIdentity.VerifiedDevice(
                 classicAddress: address, model: deviceModel, hash: hash,
-                peripheralIdentifier: peripheralIdentifier
+                peripheralIdentifier: peripheralIdentifier, blePeripheralIdentifier: blePeripheralIdentifier
             ) {
                 savedIdentity = identity
                 SonyBLEIdentity.save(identity, in: identityDefaults)
@@ -7480,7 +7601,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         guard !isSimulated, isReady, deviceModel == .wfXM5,
               payload[1] == 0x09 || payload[1] == 0x0A,
-              let device, let identity = verifiedIdentity(for: device),
+              let device, let identity = verifiedIdentity(for: device, pairedDevices: pairedDeviceInventory),
               identity.hash == bluetoothLEHash, let identifier = identity.peripheralIdentifier else { return }
         var snapshot = nativeBatterySnapshot.flatMap { $0.identifier == identifier ? $0 : nil }
             ?? SonyNativeBatterySnapshot(identifier: identifier, name: deviceName)
@@ -7652,17 +7773,18 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             transitionAddress = address
             transitionHash = bluetoothLEHash
             transitionPeripheralID = controlPeripheralID
-            #if !ACOUPLET_PUBLIC_APIS_ONLY
-            transitionPeripheralID = transitionPeripheralID ?? device.flatMap(SonyBLEIdentity.classicPeripheralIdentifier)
-            #endif
             transitionModel = deviceModel
             transitionControlAddresses = controlAddresses
         }
+        #if DEBUG
         guard !useBLE || transitionHash != nil else {
             connectionModeError = String(localized: "The headphones could not be identified. Reconnect them and try again.")
             return true
         }
         recoveryUsesBLE = useBLE
+        #else
+        recoveryUsesBLE = false
+        #endif
         retryAttempt = 0
         closeSonyLink()
         linkState = .disconnected
@@ -7843,9 +7965,14 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 finishConnectionRecoveryFailure()
                 return
             }
+            #if DEBUG
             let preferred = recoveryUsesBLE ?? (connectionTransition?.targetMode == .lowLatency)
             let useBLE = connectionTransition?.generation == .v1 ? false : retryAttempt == 0 ? preferred : !preferred
             recoveryUsesBLE = preferred
+            #else
+            let useBLE = false
+            recoveryUsesBLE = false
+            #endif
             let delay = ReconnectBackoff.delay(forAttempt: retryAttempt)
             retryAttempt += 1
             nextRetryDate = Date().addingTimeInterval(delay)
@@ -7861,11 +7988,13 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                     self.retryWorkItem = nil
                     self.nextRetryDate = nil
                     self.retrySecondsRemaining = nil
+                    #if DEBUG
                     if useBLE, let hash = self.transitionHash {
                         self.openBluetoothLE(target: .verified(hash: hash, peripheralIdentifier: self.transitionPeripheralID), model: self.transitionModel)
-                    } else {
-                        self.recoverClassicConnection()
+                        return
                     }
+                    #endif
+                    self.recoverClassicConnection()
                 }
             }
             retryWorkItem = item
@@ -7979,11 +8108,17 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
 
     @objc nonisolated
     func rfcommChannelOpenComplete(_ rfcommChannel: IOBluetoothRFCOMMChannel, status error: IOReturn) {
-        Task { @MainActor in classicChannelOpenComplete(rfcommChannel, status: error) }
+        DispatchQueue.main.async { self.classicChannelOpenComplete(rfcommChannel, status: error) }
     }
 
     func classicChannelOpenComplete(_ rfcommChannel: any RFCOMMChannel, status error: IOReturn) {
+        recordDiagnostic("RFCOMM open callback; status=\(error); current=\(channel === rfcommChannel)")
+        if let retiringIO = retiringChannelIO[ObjectIdentifier(rfcommChannel)] {
+            retiringIO.didOpen(status: error)
+            return
+        }
         guard channel === rfcommChannel else { return }
+        channelIO?.didOpen(status: error)
         guard error == kIOReturnSuccess else {
             handleOpenFailure(error)
             return
@@ -8043,11 +8178,17 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     func classicChannelClosed(_ rfcommChannel: any RFCOMMChannel) {
+        recordDiagnostic("RFCOMM close callback; current=\(channel === rfcommChannel)")
         for (identifier, write) in classicWrites where write.channel === rfcommChannel {
             write.timeout.cancel()
             classicWrites[identifier] = nil
         }
+        if let retiringIO = retiringChannelIO[ObjectIdentifier(rfcommChannel)] {
+            retiringIO.didClose()
+            return
+        }
         guard channel === rfcommChannel else { return }
+        channelIO?.didClose()
         closeSonyLink()
         isDeviceConnected = device?.isClassicConnected() ?? false
         Self.logger.info("Sony control link closed; Classic connected at callback=\(self.isDeviceConnected)")

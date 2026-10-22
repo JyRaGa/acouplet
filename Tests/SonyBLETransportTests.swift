@@ -9,7 +9,7 @@ final class SonyBLETransportTests: XCTestCase {
         let original = BLETestCentral(saved: [saved])
         let recovery = BLETestCentral()
         var centrals = [original, recovery]
-        let transport = SonyBLETransport(waitForConnection: true, isDeviceConnected: true, makeCentral: { delegate in
+        let transport = SonyBLETransport(waitForConnection: true, makeCentral: { delegate in
             let central = centrals.removeFirst()
             central.delegate = delegate
             return central
@@ -60,7 +60,7 @@ final class SonyBLETransportTests: XCTestCase {
         let original = BLETestCentral(saved: [saved])
         let recovery = BLETestCentral()
         var centrals = [original, recovery]
-        let transport = SonyBLETransport(waitForConnection: true, isDeviceConnected: true, makeCentral: { delegate in
+        let transport = SonyBLETransport(waitForConnection: true, makeCentral: { delegate in
             let central = centrals.removeFirst()
             central.delegate = delegate
             return central
@@ -81,12 +81,12 @@ final class SonyBLETransportTests: XCTestCase {
     }
 
     @MainActor
-    func testAbsentSavedDeviceKeepsWaitingUntilExplicitFailureThenBoundsRecovery() throws {
+    func testStaleSavedDeviceTimeoutFindsRotatedEndpointWhileClassicIsDisconnected() throws {
         let saved = BLETestPeripheral(name: nil)
         let original = BLETestCentral(saved: [saved])
         let recovery = BLETestCentral()
         var centrals = [original, recovery]
-        let transport = SonyBLETransport(waitForConnection: true, isDeviceConnected: false, makeCentral: { delegate in
+        let transport = SonyBLETransport(waitForConnection: true, makeCentral: { delegate in
             let central = centrals.removeFirst()
             central.delegate = delegate
             return central
@@ -97,15 +97,18 @@ final class SonyBLETransportTests: XCTestCase {
         transport.start(model: .wfXM5, target: .verified(hash: "ABCDEF12", peripheralIdentifier: saved.identifier))
         transport.handleCentralState(original)
         XCTAssertEqual(original.connections, [saved.identifier])
-        XCTAssertNil(transport.simulatedSetupTimeout)
         XCTAssertTrue(transport.isWaitingForConnection)
         XCTAssertTrue(transport.shouldCancelAutomaticConnection)
-        transport.handleCentral(original, didFailToConnect: saved, error: nil)
+        try XCTUnwrap(transport.simulatedSetupTimeout)()
         transport.handleCentralState(recovery)
         XCTAssertTrue(recovery.isScanning)
-        try XCTUnwrap(transport.simulatedSetupTimeout)()
-        XCTAssertEqual(failures, 1)
-        XCTAssertFalse(recovery.isScanning)
+        let replacement = BLETestPeripheral(name: nil)
+        XCTAssertNotEqual(replacement.identifier, saved.identifier)
+        transport.handleCentral(recovery, didDiscover: replacement, advertisementData: Self.verifiedAdvertisement, rssi: -40)
+        try XCTUnwrap(transport.simulatedSelection)()
+        XCTAssertEqual(recovery.connections, [replacement.identifier])
+        XCTAssertEqual(failures, 0)
+        XCTAssertNotNil(transport.simulatedSetupTimeout)
         XCTAssertTrue(centrals.isEmpty)
     }
 
@@ -238,6 +241,110 @@ final class SonyBLETransportTests: XCTestCase {
             XCTAssertTrue(failed)
             XCTAssertFalse(transport.isReady)
             XCTAssertEqual(target.events.contains("notify"), !invalidLength)
+        }
+    }
+
+    @MainActor
+    func testExplicitEligibilityChecksVerifiedAdvertisementWithoutGATTFlag() throws {
+        for explicit in [false, true] {
+            let central = BLETestCentral()
+            let transport = SonyBLETransport(waitForConnection: false, allowsUnadvertisedGATT: explicit, makeCentral: { _ in central })
+            defer { transport.stop() }
+            let target = BLETestPeripheral(name: nil)
+            var advertisement = Self.verifiedAdvertisement
+            var data = try XCTUnwrap(advertisement[CBAdvertisementDataManufacturerDataKey] as? Data)
+            data[16] = 0
+            advertisement[CBAdvertisementDataManufacturerDataKey] = data
+            transport.start(model: .wfXM5, target: .verified(hash: "ABCDEF12", peripheralIdentifier: nil))
+            transport.handleCentralState(central)
+            transport.handleCentral(central, didDiscover: target, advertisementData: advertisement, rssi: -40)
+            if explicit {
+                try XCTUnwrap(transport.simulatedSelection)()
+                XCTAssertEqual(central.connections, [target.identifier])
+            } else {
+                XCTAssertNil(transport.simulatedSelection)
+                XCTAssertTrue(central.connections.isEmpty)
+            }
+        }
+    }
+
+    @MainActor
+    func testEligibilityRequiresServiceAndCharacteristicPropertiesBeforePreparation() {
+        for invalid in 0..<4 {
+            let central = BLETestCentral()
+            let transport = SonyBLETransport(waitForConnection: false, makeCentral: { _ in central })
+            defer { transport.stop() }
+            let target = BLETestPeripheral(name: nil)
+            var prepared = false
+            var failed = false
+            transport.onPrepared = { prepared = true }
+            transport.onDisconnect = { _ in failed = true }
+            if invalid == 0 { target.services = [] }
+            else {
+                let uuids = [target.writer.uuid, target.notifier.uuid, target.length.uuid]
+                var characteristics = [target.writer, target.notifier, target.length]
+                characteristics[invalid - 1] = CBMutableCharacteristic(type: uuids[invalid - 1], properties: [], value: nil, permissions: [])
+                target.service.characteristics = characteristics
+            }
+            transport.start(model: .wfXM5, target: .paired(peripheralIdentifier: target.identifier))
+            transport.handleCentralState(central)
+            transport.handleCentral(central, didDiscover: target, advertisementData: [:], rssi: -40)
+            transport.handleCentral(central, didConnect: target)
+            transport.handlePeripheral(target, didDiscoverServices: nil)
+            if invalid != 0 { transport.handlePeripheral(target, didDiscoverCharacteristicsFor: target.service, error: nil) }
+            XCTAssertFalse(prepared)
+            XCTAssertTrue(failed)
+            XCTAssertFalse(target.events.contains("length"))
+            XCTAssertFalse(target.events.contains("notify"))
+        }
+    }
+
+    @MainActor
+    func testPreparedTransportPausesReadsAndRemainsBoundedUntilContinuedOrCancelled() throws {
+        for finish in ["continue", "timeout", "cancel"] {
+            let central = BLETestCentral()
+            let transport = SonyBLETransport(waitForConnection: false, makeCentral: { _ in central })
+            defer { transport.stop() }
+            let target = BLETestPeripheral(name: nil)
+            var preparations = 0
+            var failures = 0
+            transport.onPrepared = { preparations += 1 }
+            transport.onDisconnect = { _ in failures += 1 }
+            transport.start(model: .wfXM5, target: .paired(peripheralIdentifier: target.identifier))
+            transport.handleCentralState(central)
+            transport.handleCentral(central, didDiscover: target, advertisementData: [:], rssi: -40)
+            transport.handleCentral(central, didConnect: target)
+            transport.handlePeripheral(target, didDiscoverServices: nil)
+            transport.handlePeripheral(target, didDiscoverCharacteristicsFor: target.service, error: nil)
+            transport.handlePeripheral(target, didDiscoverCharacteristicsFor: target.service, error: nil)
+            XCTAssertEqual(preparations, 1)
+            XCTAssertEqual(target.events, ["services", "characteristics"])
+            XCTAssertFalse(transport.isReady)
+            XCTAssertTrue(target.writes.isEmpty)
+            let timeout = try XCTUnwrap(transport.simulatedSetupTimeout)
+            target.length.value = Data([0, 20])
+            transport.handlePeripheral(target, didUpdateValueFor: target.length, error: nil)
+            XCTAssertEqual(target.events, ["services", "characteristics"])
+            if finish == "continue" {
+                transport.continueSetup()
+                transport.continueSetup()
+                XCTAssertEqual(target.events, ["services", "characteristics", "length"])
+                transport.handlePeripheral(target, didUpdateValueFor: target.length, error: nil)
+                target.notifier.notifying = true
+                transport.handlePeripheral(target, didUpdateNotificationStateFor: target.notifier, error: nil)
+                XCTAssertTrue(transport.isReady)
+                timeout()
+                XCTAssertEqual(failures, 0)
+            } else {
+                if finish == "timeout" { timeout() }
+                else { transport.stop() }
+                transport.continueSetup()
+                timeout()
+                XCTAssertEqual(target.events, ["services", "characteristics"])
+                XCTAssertEqual(failures, finish == "timeout" ? 1 : 0)
+                XCTAssertFalse(transport.isReady)
+                XCTAssertEqual(central.cancellations, [target.identifier])
+            }
         }
     }
 
@@ -447,12 +554,13 @@ private final class BLETestPeripheral: SonyBLEPeripheral {
     let writer = CBMutableCharacteristic(type: CBUUID(string: "5B833C60-6BC7-4802-8E9A-723CECA4BD8F"), properties: .writeWithoutResponse, value: nil, permissions: .writeable)
     let notifier = BLETestNotification(type: CBUUID(string: "5B833C61-6BC7-4802-8E9A-723CECA4BD8F"), properties: .notify, value: nil, permissions: .readable)
     let length = CBMutableCharacteristic(type: CBUUID(string: "5B833C91-6BC7-4802-8E9A-723CECA4BD8F"), properties: .read, value: nil, permissions: .readable)
-    var services: [CBService]? { [service] }
+    var services: [CBService]?
 
     init(name: String?, identifier: UUID = UUID()) {
         self.identifier = identifier
         self.name = name
         service.characteristics = [writer, notifier, length]
+        services = [service]
     }
 
     func discoverServices(_ serviceUUIDs: [CBUUID]?) { events.append("services") }

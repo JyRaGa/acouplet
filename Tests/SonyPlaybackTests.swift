@@ -199,6 +199,50 @@ final class SonyPlaybackTests: XCTestCase {
         XCTAssertFalse(controller.refreshMusicVolume())
     }
     @MainActor
+    func testLegacyVolumeAdmissionPreservesSessionAfterOptionalReadExpiry() async {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        controller.simulateDeviceConnection(named: "WH-XB900N")
+        controller.simulateProtocolMessage([0x01, 0, 2, 0x10], beginConnection: true)
+        acknowledgeSimulatedCommands(controller)
+        controller.simulateProtocolMessage([0x07, 0, 5, 0xA1, 0xE2, 0xF4, 0x41, 0x42])
+        acknowledgeSimulatedCommands(controller)
+        for payload: [UInt8] in [[0xA1, 1, 31, 1, 0], [0xA3, 1, 0, 2], [0xA7, 1, 0x20, 12]] {
+            controller.simulateProtocolMessage(payload)
+        }
+        controller.simulateLegacyDSEEReadTimeout([0xE0, 2])
+        controller.simulateSystemReadTimeout([0xF0, 4])
+        controller.simulateLegacySoundEffectReadTimeout([0x40, 1, 1])
+        controller.simulateLegacySoundEffectReadTimeout([0x40, 2, 1])
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertNotNil(controller.settingErrors[.dsee])
+        XCTAssertNotNil(controller.settingErrors[.automaticPowerOff])
+        XCTAssertNotNil(controller.settingErrors[.legacySoundEffect(.surround)])
+        XCTAssertNotNil(controller.settingErrors[.legacySoundEffect(.soundPosition)])
+        XCTAssertTrue(controller.isReady)
+        XCTAssertTrue(controller.hasFreshMusicVolumeReadback)
+        let session = controller.simulatedControlSession
+        let volume = controller.musicVolumeReadbackID
+        let transmitted = controller.simulatedTransmittedFrames.count
+        XCTAssertTrue(controller.refreshMusicVolume())
+        acknowledgeSimulatedCommands(controller)
+        XCTAssertEqual(controller.simulatedControlSession, session)
+        XCTAssertTrue(controller.isReady)
+        XCTAssertEqual(Array(controller.simulatedTransmittedFrames.dropFirst(transmitted).map(\.payload)), [[0xA2, 1], [0xA6, 1, 0x20]])
+        XCTAssertFalse(controller.hasFreshMusicVolumeReadback)
+        XCTAssertEqual(controller.musicVolumeReadbackID, volume)
+        controller.simulateProtocolMessage([0xA3, 1, 0, 2])
+        XCTAssertFalse(controller.hasFreshMusicVolumeReadback)
+        controller.simulateProtocolMessage([0xA7, 1, 0x20, 13])
+        XCTAssertNotEqual(controller.musicVolumeReadbackID, volume)
+        XCTAssertTrue(controller.hasFreshMusicVolumeReadback)
+        XCTAssertEqual(controller.simulatedControlSession, session)
+        controller.refresh()
+        XCTAssertGreaterThan(controller.simulatedControlSession, session)
+        XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0, 0])
+    }
+
+    @MainActor
     func testLegacyAdmissionRefreshRetiresTimedOutReadsWithoutGrantingFreshness() async throws {
         let controller = makeLegacyPlaybackController()
         defer { controller.simulateControlLoss() }
@@ -990,6 +1034,46 @@ final class SonyPlaybackTests: XCTestCase {
     }
 
     #if !ACOUPLET_PUBLIC_APIS_ONLY
+    @MainActor
+    func testModernLDACSettingsRefreshPreservesSessionAndRefreshesSourceAfterOptionalExpiry() async {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        controller.simulateDeviceConnection(named: "WF-1000XM5")
+        controller.refreshEqualizer()
+        acknowledgeSimulatedCommands(controller)
+        controller.simulateEqualizerReadTimeout()
+        for _ in 0..<8 { await Task.yield() }
+        XCTAssertTrue(controller.isReady)
+        let session = controller.simulatedControlSession
+        let readback = controller.musicVolumeReadbackID
+        let transmitted = controller.simulatedTransmittedFrames.count
+        controller.requestCurrentSettings()
+        acknowledgeSimulatedCommands(controller)
+        let frames = Array(controller.simulatedTransmittedFrames.dropFirst(transmitted))
+        XCTAssertEqual(controller.simulatedControlSession, session)
+        XCTAssertTrue(controller.isReady)
+        XCTAssertTrue(frames.contains { $0.type == 0x0C && $0.payload == [0xA2, 1] })
+        XCTAssertTrue(frames.contains { $0.type == 0x0C && $0.payload == [0xA6, 0x20] })
+        XCTAssertTrue(frames.contains { $0.type == 0x0E && $0.payload == [0x36, 2] })
+        XCTAssertFalse(controller.hasFreshMusicVolumeReadback)
+        controller.simulateProtocolMessage([0x37] + sourceInventory(selected: 2).dropFirst(), type: 0x0E)
+        XCTAssertFalse(controller.hasCurrentMusicSourceContext(for: "02:00:00:00:00:01"))
+        acknowledgeSimulatedCommands(controller)
+        controller.simulateProtocolMessage([0xA1, 1, 31, 16])
+        controller.simulateProtocolMessage([0xA3, 1, 0, 2, 0])
+        controller.simulateProtocolMessage([0xA7, 0x20, 14])
+        acknowledgeSimulatedCommands(controller)
+        controller.simulateProtocolMessage([0xA1, 1, 31, 16])
+        controller.simulateProtocolMessage([0xA3, 1, 0, 2, 0])
+        controller.simulateProtocolMessage([0xA7, 0x20, 14])
+        XCTAssertTrue(controller.hasFreshMusicVolumeReadback)
+        XCTAssertNotEqual(controller.musicVolumeReadbackID, readback)
+        XCTAssertFalse(controller.hasCurrentMusicSourceContext(for: "02:00:00:00:00:01"))
+        XCTAssertEqual(controller.simulatedControlSession, session)
+        controller.refresh()
+        XCTAssertGreaterThan(controller.simulatedControlSession, session)
+    }
+
     @MainActor
     func testNativeLDACSourceWaitsForCurrentCapabilitiesAndLocalInventory() {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)

@@ -84,6 +84,11 @@ struct LDACPriorityControl: Sendable {
     struct State: Sendable {
         let phase: String
         let error: String?
+        var prioritySent: Bool? = nil
+
+        var diagnosticDescription: String {
+            "phase=\(phase); priority-sent=\(prioritySent.map { String($0) } ?? "unknown"); error=\(error ?? "none")"
+        }
     }
 
     let request: @Sendable (Bool, Bool) throws -> Void
@@ -245,6 +250,7 @@ final class LDACNativeSession: @unchecked Sendable {
     private var diagnosticsLock: FileHandle?
     private var loggedBytes = 0
     private var diagnosticStage = "startup"
+    private var lastSenderTiming: String?
 
     init(id: UUID, address: String, helpers: Helpers, gain: Double, outputDeviceUID: String? = nil,
          priority: LDACPriorityControl? = nil,
@@ -595,6 +601,7 @@ final class LDACNativeSession: @unchecked Sendable {
                 waitingMediaClosed = true
             }
         } else if source == "media" {
+            if let timing = Self.senderTimingSummary(line) { lastSenderTiming = timing }
             if line == "PCM_STOP_READY started=0", mediaStopSent, !started, shouldStop { mediaStopReady = true }
             if line == "MEDIA_PREPARED" { mediaPrepared = true }
             if line.hasPrefix("READY ") {
@@ -810,7 +817,7 @@ final class LDACNativeSession: @unchecked Sendable {
             if startAccepted && !started {
                 if let priority {
                     let state = try priority.state()
-                    if let error = state.error { throw LDACSessionError(error) }
+                    if state.error != nil { throw LDACSessionError(state.diagnosticDescription) }
                     guard state.phase == "configuring" || state.phase == "configured" else {
                         throw LDACSessionError("Bluetooth could not configure LDAC playback priority. Try LDAC again.")
                     }
@@ -966,7 +973,7 @@ final class LDACNativeSession: @unchecked Sendable {
                 try priority.request(false, false)
             }
             let state = try priority.state()
-            if let error = state.error { throw LDACSessionError(error) }
+            if state.error != nil { throw LDACSessionError(state.diagnosticDescription) }
             if state.phase == "idle" {
                 priorityPhase = .removed
                 record("PRIORITY_CLEANUP_ATTEMPT_COMPLETED controllerAcknowledgment=0")
@@ -994,7 +1001,7 @@ final class LDACNativeSession: @unchecked Sendable {
                 record("PRIORITY_REMOVAL_COMPLETED oldACLDisconnected=1")
                 return true
             }
-            if let error = state.error { throw LDACSessionError(error) }
+            if state.error != nil { throw LDACSessionError(state.diagnosticDescription) }
             if DispatchTime.now() >= priorityDeadline {
                 throw LDACSessionError("Bluetooth playback priority cleanup is still pending after reconnection.")
             }
@@ -1263,11 +1270,18 @@ final class LDACNativeSession: @unchecked Sendable {
         return fields.joined(separator: " ")
     }
 
+    static func senderTimingSummary(_ line: String) -> String? {
+        let fields = ["serviceMean", "serviceMax", "sendMax", "waitMax", "localStallMax", "debtMax", "debt"]
+            .map { "\($0)=[0-9]+\\.[0-9]{6}" }.joined(separator: " ")
+        return LDACChannelGate.captures("^SENDER_TIMING packets=[0-9]+ waits=[0-9]+ (\(fields)) clock=uptime-raw$", line)?.first
+    }
+
     private func diagnose(_ message: String, stage: String? = nil, isFailure: Bool = false) {
         if let stage { diagnosticStage = stage }
         let detail = message.hasPrefix("PCM_FAILED ") ? Self.helperFailureSummary(message) : message
         emit(.diagnostic(Diagnostic(stage: diagnosticStage, detail: detail, isFailure: isFailure)))
         if isFailure {
+            if let lastSenderTiming { emit(.diagnostic(Diagnostic(stage: "sender timing (seconds)", detail: lastSenderTiming))) }
             let readiness = "preflight=\(preflightCompleted) armed=\(signalingArmed != nil) acl=\(connected) connector=\(connectorReady) signal=\(signalingGate.opened) media=\(mediaGate.opened) capture=\(captureReady) pcm=\(pcmReady) start=\(startAccepted) priority=\(priorityPhase) active=\(active)"
             emit(.diagnostic(Diagnostic(stage: "readiness", detail: readiness)))
             let statuses = children.keys.sorted().map { name in

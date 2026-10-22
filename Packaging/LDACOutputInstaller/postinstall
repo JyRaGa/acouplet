@@ -5,7 +5,7 @@ ldac_driver=/Library/Audio/Plug-Ins/HAL/AcoupletLDACOutput.driver
 ldac_legacy_driver=/Library/Audio/Plug-Ins/HAL/XM5LDACOutput.driver
 ldac_team='@ACOUPLET_LDAC_SIGNING_TEAM_ID@'
 if [ ! -d "$ldac_driver" ] ||
-   [ "$(/usr/libexec/PlistBuddy -c 'Print :AcoupletLDACDriverRevision' "$ldac_driver/Contents/Info.plist" 2>/dev/null || true)" != 5 ]; then
+   [ "$(/usr/libexec/PlistBuddy -c 'Print :AcoupletLDACDriverRevision' "$ldac_driver/Contents/Info.plist" 2>/dev/null || true)" != 6 ]; then
     printf '%s\n' 'The installed driver does not match the required Acouplet LDAC output revision. The previous driver was preserved.' >&2
     exit 1
 fi

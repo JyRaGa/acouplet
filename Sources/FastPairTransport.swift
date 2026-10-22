@@ -54,7 +54,8 @@ final class FastPairTransport: NSObject {
     }
 
     #if DEBUG
-    func simulateConnection(address: String, device: any FastPairDevice, channel: any FastPairChannel) {
+    @discardableResult
+    func simulateConnection(address: String, device: any FastPairDevice, channel: any FastPairChannel) -> ChannelDelegate {
         close()
         let identifier = UUID()
         session = identifier
@@ -66,6 +67,7 @@ final class FastPairTransport: NSObject {
         delegate.channelIO = RFCOMMChannelIO(channel: channel)
         channelDelegate = delegate
         isOpen = true
+        return delegate
     }
     func simulateOpenTimeout() { openTimeout?.perform() }
     #endif
@@ -200,8 +202,9 @@ final class FastPairTransport: NSObject {
         let result = target.openRFCOMMChannelAsync(&openedChannel, withChannelID: channelID, delegate: delegate)
         channel = openedChannel
         delegate.channel = openedChannel
-        if let openedChannel { delegate.channelIO = RFCOMMChannelIO(channel: openedChannel) }
+        if let openedChannel { delegate.channelIO = RFCOMMChannelIO(channel: openedChannel, opening: true) }
         guard result == kIOReturnSuccess, openedChannel != nil else {
+            delegate.channelIO?.didOpen(status: result)
             fail(String(localized: "Could not connect to the earbuds to play a locating sound. Try again."))
             return
         }
@@ -246,8 +249,9 @@ final class FastPairTransport: NSObject {
     final class ChannelDelegate: NSObject {
         weak var owner: FastPairTransport?
         let session: UUID
-        var channel: (any FastPairChannel)?
+        weak var channel: (any FastPairChannel)?
         var channelIO: RFCOMMChannelIO?
+        private var retired = false
 
         init(owner: FastPairTransport, session: UUID) {
             self.owner = owner
@@ -256,12 +260,13 @@ final class FastPairTransport: NSObject {
 
         func retire(completion: DispatchGroup) {
             owner = nil
-            channel = nil
-            guard let channelIO else { return }
-            self.channelIO = nil
+            guard let channelIO, !retired else { return }
+            retired = true
             completion.enter()
-            channelIO.close {
-                withExtendedLifetime(self) { completion.leave() }
+            channelIO.close { _, _ in
+                self.channel = nil
+                self.channelIO = nil
+                completion.leave()
             }
         }
 
@@ -274,6 +279,8 @@ final class FastPairTransport: NSObject {
         }
 
         func didOpen(_ channel: any FastPairChannel, status: IOReturn) {
+            guard self.channel === channel else { return }
+            channelIO?.didOpen(status: status)
             owner?.didOpen(channel, status: status, session: session)
         }
 
@@ -309,6 +316,7 @@ final class FastPairTransport: NSObject {
 
         func didClose(_ channel: any FastPairChannel) {
             guard self.channel === channel else { return }
+            channelIO?.didClose()
             owner?.didClose(channel, session: session)
         }
     }

@@ -16195,6 +16195,23 @@
         }
       }
     },
+    "The Bluetooth audio setup failed. Try LDAC again.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The Bluetooth audio setup failed. Try LDAC again."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth ses bağlantısı kurulamadı. LDAC'ı tekrar deneyin."
+          }
+        }
+      }
+    },
     "The LDAC driver could not confirm the Bluetooth audio setup. Try again.": {
       "extractionState": "manual",
       "localizations": {

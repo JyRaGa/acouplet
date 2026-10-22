@@ -1,3 +1,4 @@
+#if DEBUG
 import CoreBluetooth
 import Foundation
 
@@ -81,6 +82,7 @@ extension CBCentralManager: SonyBLECentral {
 
 @MainActor
 final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate, @preconcurrency CBPeripheralDelegate {
+    var onPrepared: (() -> Void)?
     var onReady: ((UUID, String?) -> Void)?
     var onData: ((Data) -> Void)?
     var onDisconnect: ((String?) -> Void)?
@@ -105,6 +107,7 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
     private var notifyCharacteristic: CBCharacteristic?
     private var lengthCharacteristic: CBCharacteristic?
     private var maximumLength: Int?
+    private var isSetupPaused = false
     private var writes = SonyBLEWriteBuffer()
     private var completions: [(isCurrent: (() -> Bool)?, cancelled: () -> Void, completed: () -> Void)] = []
     private var isDraining = false
@@ -114,16 +117,16 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
     private var isTryingSavedIdentifier = false
     private var hasRetriedVerifiedIdentity = false
     private let waitsForConnection: Bool
-    private let deviceWasConnected: Bool
+    private let allowsUnadvertisedGATT: Bool
     private var selectionTask: Task<Void, Never>?
     private var writeTimeout: Task<Void, Never>?
 
-    init(waitForConnection: Bool, isDeviceConnected: Bool = false, makeCentral: @escaping (any CBCentralManagerDelegate) -> any SonyBLECentral = {
+    init(waitForConnection: Bool, allowsUnadvertisedGATT: Bool = false, makeCentral: @escaping (any CBCentralManagerDelegate) -> any SonyBLECentral = {
         CBCentralManager(delegate: $0, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false])
     }) {
         self.makeCentral = makeCentral
         waitsForConnection = waitForConnection
-        deviceWasConnected = isDeviceConnected
+        self.allowsUnadvertisedGATT = allowsUnadvertisedGATT
         super.init()
     }
 
@@ -179,7 +182,7 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         setupTimeout?.cancel()
         setupTimeout = nil
         guard let id = sessionID,
-              let duration = Self.setupTimeoutDuration(waitForConnection: waitsForConnection && !(isTryingSavedIdentifier && deviceWasConnected) && !hasRetriedVerifiedIdentity, isWaitingForConnection: isWaitingForConnection) else { return }
+              let duration = Self.setupTimeoutDuration(waitForConnection: waitsForConnection && !isTryingSavedIdentifier && !hasRetriedVerifiedIdentity, isWaitingForConnection: isWaitingForConnection) else { return }
         setupTimeout = Task { [weak self] in
             do { try await Task.sleep(for: duration) } catch { return }
             self?.setupTimedOut(session: id)
@@ -216,6 +219,7 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         notifyCharacteristic = nil
         lengthCharacteristic = nil
         maximumLength = nil
+        isSetupPaused = false
         writes = SonyBLEWriteBuffer()
         completions.removeAll()
     }
@@ -272,7 +276,7 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         guard case .verified(let expectedHash, _) = connectionTarget,
               let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
               let advertisement = SonyBLEIdentity.advertisement(from: data),
-              advertisement.supportsGATT, advertisement.hash == expectedHash else { return }
+              (advertisement.supportsGATT || allowsUnadvertisedGATT), advertisement.hash == expectedHash else { return }
         let name = Self.matchingName(peripheralName: target.name, advertisedName: advertisementData[CBAdvertisementDataLocalNameKey] as? String, model: expectedModel)
         candidates[target.identifier] = (target, name)
         guard selectionTask == nil, let id = sessionID else { return }
@@ -356,15 +360,29 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
             fail(String(localized: "Could not set up the headphones’ Bluetooth control connection."))
             return
         }
+        guard writeCharacteristic == nil else { return }
         writeCharacteristic = writer
         notifyCharacteristic = notifier
         lengthCharacteristic = length
+        isSetupPaused = true
+        if let onPrepared {
+            isTryingSavedIdentifier = false
+            recordStage("GATT eligible; waiting for Classic retirement")
+            onPrepared()
+        } else {
+            continueSetup()
+        }
+    }
+
+    func continueSetup() {
+        guard isSetupPaused, let target = peripheral, let length = lengthCharacteristic else { return }
+        isSetupPaused = false
         recordStage("reading C91 write length")
         target.readValue(for: length)
     }
 
     func handlePeripheral(_ target: any SonyBLEPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard target === peripheral, characteristic === lengthCharacteristic || characteristic === notifyCharacteristic else { return }
+        guard target === peripheral, !isSetupPaused, characteristic === lengthCharacteristic || characteristic === notifyCharacteristic else { return }
         if let error { fail(error); return }
         guard let data = characteristic.value else {
             fail(String(localized: "The headphones returned an empty response. Try again."))
@@ -385,7 +403,7 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
     }
 
     func handlePeripheral(_ target: any SonyBLEPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        guard target === peripheral, characteristic === notifyCharacteristic else { return }
+        guard target === peripheral, !isSetupPaused, characteristic === notifyCharacteristic else { return }
         if let error { fail(error); return }
         guard characteristic.isNotifying, maximumLength != nil else {
             fail(String(localized: "Could not receive updates from the headphones. Try again."))
@@ -524,3 +542,4 @@ final class SonyBLETransport: NSObject, @preconcurrency CBCentralManagerDelegate
         onDisconnect?(message)
     }
 }
+#endif

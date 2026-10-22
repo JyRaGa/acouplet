@@ -11,7 +11,7 @@ driver = (Path(__file__).resolve().parent / "VirtualOutput/AcoupletVirtualOutput
 assert re.search(r'kAcoupletLease,\s*kAudioServerPlugInCustomPropertyDataTypeCFPropertyList,\s*kAudioServerPlugInCustomPropertyDataTypeNone', driver)
 claim = source[source.index("    nonisolated static func canTransferControls("):source.index("    func priorityControl(")]
 priority = source[source.index("    func priorityControl("):source.index("    func selectForHandoff(")]
-priority_state = source[source.index("    private nonisolated static func priorityState("):source.index("    private nonisolated static func read<T>(")]
+priority_state = source[source.index("    private nonisolated static func validatePriority("):source.index("    private nonisolated static func read<T>(")]
 lease_state = source[source.index("    private nonisolated static func leaseIsOwned("):source.index("    private func listen(")]
 apply = source[source.index("    private func applyControls("):source.index("    private func verifyRoute(")]
 method = source[source.index("    @discardableResult\n    func silence("):source.index("    private func applyControls(")]
@@ -22,6 +22,12 @@ handoff = source[source.index("    func selectForHandoff()"):source.index("    @
 verify = source[source.index("    private func verifyRoute()"):source.index("    private func hasSelectedFormat()")]
 selectors = source[source.index("    private var handoffSelectors:"):source.index("    init(id:")]
 volume = source[source.index("struct LDACNativeVolume:"):source.index("\n@MainActor\nfinal class LDACNativeOutput")]
+session_source = (Path(__file__).resolve().parents[2] / "Sources/LDACNativeSession.swift").read_text()
+owner_source = (Path(__file__).resolve().parents[2] / "Sources/LDACOwner.swift").read_text()
+priority_types = session_source[session_source.index("struct LDACPriorityControl:"):session_source.index("final class LDACNativeSession:")]
+diagnostic_type = session_source[session_source.index("    struct Diagnostic:"):session_source.index("    struct Completion:")]
+owner_error = owner_source[owner_source.index("struct LDACOwnerError:"):owner_source.index("private final class LDACOwnerChannel:")]
+diagnostic_description = source[source.index("    static func diagnosticDescription("):source.index("    struct OutputError:")]
 fixture = r'''
 import Foundation
 import CoreAudio
@@ -74,15 +80,11 @@ enum SonyBLEIdentity {
     }
 }
 enum LDACSampleRate: Int, Codable { case hz48000 = 48000 }
-struct LDACPriorityControl: Sendable {
-    struct State: Sendable { let phase: String; let error: String? }
-    let request: @Sendable (Bool, Bool) throws -> Void
-    let state: @Sendable () throws -> State
+__PRIORITY_TYPES__
+struct LDACNativeSession {
+__DIAGNOSTIC_TYPE__
 }
-struct LDACPriorityCleanupError: LocalizedError, Sendable {
-    let message: String
-    var errorDescription: String? { message }
-}
+__OWNER_ERROR__
 @MainActor
 enum CBManager {
     enum Authorization { case allowedAlways, denied }
@@ -212,9 +214,6 @@ __VOLUME__
 
 @MainActor
 final class LDACNativeOutput {
-    static func diagnosticDescription(_ error: Error) -> String {
-        (error as? OutputError)?.diagnosticDescription ?? error.localizedDescription
-    }
     static var routeOwner: FileHandle?
     var holdsRouteOwner = false
     var restoringOwner = false
@@ -427,6 +426,7 @@ __CLAIM__
 __HANDOFF__
 __VERIFY__
 __PRIORITY__
+__DIAGNOSTIC_DESCRIPTION__
 __PRIORITY_STATE__
 __LEASE_STATE__
 __HAL_WRITE__
@@ -443,6 +443,28 @@ enum Check {
     @MainActor
     static func main() async {
         typealias Output = LDACNativeOutput
+        let priorityFailures: [(String, Bool?)] = [("preparation-failed", false), ("cleanup-required", true), ("cleanup-required", nil)]
+        for (phase, sent) in priorityFailures {
+            Output.reset()
+            Output.priorityReply = ["phase": phase, "address": Output.targetUID,
+                "error": "Audio-host connection was interrupted."]
+            if let sent { Output.priorityReply["prioritySent"] = sent }
+            let output = Output()
+            do {
+                _ = try output.priorityControl()
+                preconditionFailure("Failed priority preparation was accepted")
+            } catch {
+                precondition((error is LDACPriorityCleanupError) == (phase == "cleanup-required"))
+                let forwarded = LDACOwnerError(error)
+                let encoded = try! JSONEncoder().encode(forwarded)
+                let decoded = try! JSONDecoder().decode(LDACOwnerError.self, from: encoded)
+                precondition(decoded.diagnostic?.detail == "phase=\(phase); priority-sent=\(sent.map { String($0) } ?? "unknown"); error=Audio-host connection was interrupted.")
+                precondition(decoded.diagnostic?.isFailure == true)
+            }
+            output.isSelected = false
+            _ = await output.restoreAndRelease()
+            precondition(!output.ownsLease && Output.writes.isEmpty)
+        }
         let arguments = Foundation.ProcessInfo.processInfo.arguments
         if arguments.count == 3 {
             Output.routeDirectory = arguments[2]
@@ -741,7 +763,8 @@ enum Check {
             ["phase": "cleanup-required", "address": "not-an-address"],
             ["phase": "cleanup-required", "address": 42],
             ["phase": "invalid", "address": Output.previousAddress],
-            ["phase": "cleanup-required", "address": Output.previousAddress, "error": 42]
+            ["phase": "cleanup-required", "address": Output.previousAddress, "error": 42],
+            ["phase": "cleanup-required", "address": Output.previousAddress, "prioritySent": 1]
         ]
         for invalid in invalidReplies {
             Output.reset()
@@ -949,7 +972,7 @@ enum Check {
         print("PASS actual native output claim/configure/silence/restoration and scoped HAL write, replacement-owner mute/route preservation, monotonic deadlines, bounded previous-priority cleanup, lease renewal during MainActor stall, in-flight renewal/release ordering, stale versus active failure reporting, and balanced playback activity lifetime; no audio devices accessed")
     }
 }
-'''.replace("__SELECTORS__", selectors).replace("__HANDOFF__", handoff).replace("__VERIFY__", verify).replace("__VOLUME__", volume).replace("__METHOD__", method).replace("__CLAIM__", claim).replace("__APPLY__", apply).replace("__PRIORITY__", priority).replace("__PRIORITY_STATE__", priority_state).replace("__LEASE_STATE__", lease_state).replace("__HAL_WRITE__", hal_write).replace("__ROUTE_OWNER__", route_owner).replace("__SET_LEASE__", set_lease)
+'''.replace("__PRIORITY_TYPES__", priority_types).replace("__DIAGNOSTIC_TYPE__", diagnostic_type).replace("__OWNER_ERROR__", owner_error).replace("__DIAGNOSTIC_DESCRIPTION__", diagnostic_description).replace("__SELECTORS__", selectors).replace("__HANDOFF__", handoff).replace("__VERIFY__", verify).replace("__VOLUME__", volume).replace("__METHOD__", method).replace("__CLAIM__", claim).replace("__APPLY__", apply).replace("__PRIORITY__", priority).replace("__PRIORITY_STATE__", priority_state).replace("__LEASE_STATE__", lease_state).replace("__HAL_WRITE__", hal_write).replace("__ROUTE_OWNER__", route_owner).replace("__SET_LEASE__", set_lease)
 
 with tempfile.TemporaryDirectory(prefix="acouplet-native-output-restore-") as directory:
     directory = Path(directory)

@@ -272,6 +272,7 @@ final class LDACNativeOutput {
         }
         let preparation: [String: Any] = ["address": address as CFString, "enabled": kCFBooleanFalse!, "prepare": kCFBooleanTrue!]
         try Self.write(device, selector: Self.prioritySelector, value: preparation as CFDictionary)
+        try Self.validatePriority(Self.priorityState(device, address: address))
         return LDACPriorityControl(request: { enabled, disconnected in
             var value: [String: Any] = ["address": address as CFString, "enabled": enabled ? kCFBooleanTrue! : kCFBooleanFalse!]
             if disconnected { value["disconnected"] = kCFBooleanTrue! }
@@ -309,7 +310,8 @@ final class LDACNativeOutput {
                 ] as CFDictionary)
             }
             guard clock.now < deadline else {
-                throw LDACPriorityCleanupError(message: String(localized: "LDAC did not stop completely."))
+                throw LDACPriorityCleanupError(message: String(localized: "LDAC did not stop completely."),
+                    diagnostic: .init(stage: "native output", detail: current.state.diagnosticDescription, isFailure: true))
             }
             try await Task.sleep(for: .milliseconds(100))
         }
@@ -477,10 +479,7 @@ final class LDACNativeOutput {
         try verifyRoute()
         if observesPriority {
             let priority = try Self.priorityState(device, address: address)
-            guard priority.phase != "cleanup-required" else {
-                Self.logger.error("LDAC priority cleanup required: \(priority.error ?? "No driver error", privacy: .private)")
-                throw LDACPriorityCleanupError(message: String(localized: "LDAC did not stop completely."))
-            }
+            try Self.validatePriority(priority)
         }
         let scalar: Float32 = try Self.read(device, selector: kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, initial: 0)
         let muted: UInt32 = try Self.read(device, selector: kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput, initial: 0)
@@ -611,6 +610,16 @@ final class LDACNativeOutput {
         return value.takeRetainedValue() as String
     }
 
+    private nonisolated static func validatePriority(_ priority: LDACPriorityControl.State) throws {
+        if priority.phase == "preparation-failed" {
+            throw OutputError(priority.diagnosticDescription, userFacing: String(localized: "The Bluetooth audio setup failed. Try LDAC again."))
+        }
+        if priority.phase == "cleanup-required" {
+            throw LDACPriorityCleanupError(message: String(localized: "LDAC did not stop completely."),
+                diagnostic: .init(stage: "native output", detail: priority.diagnosticDescription, isFailure: true))
+        }
+    }
+
     private nonisolated static func priorityState(_ object: AudioObjectID, address: String) throws -> LDACPriorityControl.State {
         let snapshot = try prioritySnapshot(object)
         if let reportedAddress = snapshot.address, reportedAddress != SonyBLEIdentity.normalizedAddress(address) {
@@ -626,7 +635,7 @@ final class LDACNativeOutput {
         guard CFGetTypeID(state) == CFDictionaryGetTypeID(), let state = state as? [String: Any],
               let phaseValue = state["phase"], CFGetTypeID(phaseValue as CFTypeRef) == CFStringGetTypeID(),
               let phase = phaseValue as? String,
-              ["idle", "observing", "configuring", "configured", "stopping", "cleanup-required"].contains(phase) else {
+              ["idle", "observing", "preparation-failed", "configuring", "configured", "stopping", "cleanup-required"].contains(phase) else {
             throw OutputError("The Acouplet LDAC Output driver returned an invalid Bluetooth priority state.", userFacing: String(localized: "The LDAC driver could not confirm the Bluetooth audio setup. Try again."))
         }
         var address: String?
@@ -647,7 +656,14 @@ final class LDACNativeOutput {
             }
             error = reportedError
         }
-        return (LDACPriorityControl.State(phase: phase, error: error), address)
+        var prioritySent: Bool?
+        if let reportedSent = state["prioritySent"] {
+            guard CFGetTypeID(reportedSent as CFTypeRef) == CFBooleanGetTypeID(), let reportedSent = reportedSent as? Bool else {
+                throw OutputError("The Acouplet LDAC Output driver returned an invalid Bluetooth priority mutation state.", userFacing: String(localized: "The LDAC driver returned an unexpected response. Try again."))
+            }
+            prioritySent = reportedSent
+        }
+        return (LDACPriorityControl.State(phase: phase, error: error, prioritySent: prioritySent), address)
     }
 
     private nonisolated static func read<T>(_ object: AudioObjectID, selector: AudioObjectPropertySelector,
@@ -680,7 +696,7 @@ final class LDACNativeOutput {
     }
 
     static func diagnosticDescription(_ error: Error) -> String {
-        (error as? OutputError)?.diagnosticDescription ?? error.localizedDescription
+        (error as? OutputError)?.diagnosticDescription ?? (error as? LDACPriorityCleanupError)?.diagnostic?.detail ?? error.localizedDescription
     }
 
     struct OutputError: LocalizedError {
