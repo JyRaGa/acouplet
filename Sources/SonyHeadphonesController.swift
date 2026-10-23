@@ -829,6 +829,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var multipointRecoveryAttempts = 0
     private var unconfirmedEqualizerRequestID: UUID?
     private var acknowledgmentTimeout: DispatchWorkItem?
+    private var legacyCommandSpacing: (frame: SonyFrame, timer: DispatchWorkItem)?
     private var transmissionID: UUID?
     private var transmissionOrdinal: UInt64 = 0
     private var completedTransmissionOrdinal: UInt64 = 0
@@ -897,6 +898,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var powerRequestIDs: [Setting: UUID] = [:]
     private var staminaChange: SonyStaminaChange?
     private static let powerOffPayload: [UInt8] = [0x24, 0x03, 0x01]
+    private static let legacyCommandSpacingInterval: TimeInterval = 0.08
     private var isSimulated = false
     private var lastReadyTransportWasBluetoothLE = false
     #if DEBUG
@@ -5183,6 +5185,8 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         transmittedFrame = nil
         acknowledgmentTimeout?.cancel()
         acknowledgmentTimeout = nil
+        legacyCommandSpacing?.timer.cancel()
+        legacyCommandSpacing = nil
         transmissionID = nil
     }
 
@@ -6241,7 +6245,9 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                     }
                     #endif
                 }
-                if let next = acknowledgment.nextFrame { transmit(next) }
+                if let next = acknowledgment.nextFrame {
+                    if protocolInformation?.generation == .v1, !isSimulated { transmitAfterLegacySpacing(next, session: session) } else { transmit(next) }
+                }
                 if playbackAcknowledged, isReady {
                     send([0xA2, 0x01])
                     send([0xA6, 0x01])
@@ -6275,9 +6281,33 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 guard let self, self.controlSession == session else { return }
                 self.pendingInboundAcknowledgments -= 1
                 if waitsForAcknowledgment { received() }
+                self.transmitSpacedLegacyCommand()
                 self.verifyConnectionPreferenceIfNeeded()
             }) else { return }
         }
+    }
+
+    // MDR v1 headphones such as the WH-XB900N hold each reply until the previous one is acknowledged
+    // and drop replies that pile up behind a late acknowledgment, so the next command waits until a
+    // reply has been acknowledged, or for a short interval when the command has no reply.
+    private func transmitAfterLegacySpacing(_ frame: SonyFrame, session: UInt64) {
+        legacyCommandSpacing?.timer.cancel()
+        let timer = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.controlSession == session else { return }
+                self.transmitSpacedLegacyCommand()
+            }
+        }
+        legacyCommandSpacing = (frame, timer)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.legacyCommandSpacingInterval, execute: timer)
+    }
+
+    private func transmitSpacedLegacyCommand() {
+        guard let spacing = legacyCommandSpacing else { return }
+        spacing.timer.cancel()
+        legacyCommandSpacing = nil
+        guard commandQueue.pending == spacing.frame, transmittedFrame == nil else { return }
+        transmit(spacing.frame)
     }
 
     private func powerQuerySetting(_ payload: [UInt8], type: UInt8) -> Setting? {
