@@ -60,6 +60,28 @@ final class RFCOMMChannelIOTests: XCTestCase {
     }
 
     @MainActor
+    func testPriorityWritesGoAheadOfQueuedWritesInOrder() async {
+        let started = expectation(description: "Write started")
+        let completed = expectation(description: "Writes completed")
+        completed.expectedFulfillmentCount = 5
+        let release = DispatchSemaphore(value: 0)
+        let channel = TestChannel(onFirstWrite: {
+            started.fulfill()
+            XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+        })
+        let io = RFCOMMChannelIO(channel: channel)
+        io.write(Data([1])) { _ in completed.fulfill() }
+        await fulfillment(of: [started], timeout: 2)
+        io.write(Data([2])) { _ in completed.fulfill() }
+        io.write(Data([3]), priority: true) { _ in completed.fulfill() }
+        io.write(Data([4])) { _ in completed.fulfill() }
+        io.write(Data([5]), priority: true) { _ in completed.fulfill() }
+        release.signal()
+        await fulfillment(of: [completed], timeout: 2)
+        XCTAssertEqual(channel.writes, [Data([1]), Data([3]), Data([5]), Data([2]), Data([4])])
+    }
+
+    @MainActor
     func testCloseRetiresQueuedWritesAndWaitsForBlockedWrite() async {
         let started = expectation(description: "Write started")
         let closeReturned = expectation(description: "Native close returned")

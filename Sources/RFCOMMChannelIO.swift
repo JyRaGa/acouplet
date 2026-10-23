@@ -16,6 +16,14 @@ final class RFCOMMChannelIO: NSObject, @unchecked Sendable {
     private let writeQueue = DispatchQueue(label: "dev.baglayan.Acouplet.rfcomm-write", qos: .utility)
     private let lock = NSLock()
     private var retired = false
+    private var pendingWrites: [PendingWrite] = []
+    private var pendingPriorityWrites = 0
+
+    private struct PendingWrite {
+        let data: Data
+        let willSend: (@MainActor @Sendable () -> Bool)?
+        let completion: @MainActor @Sendable (IOReturn) -> Void
+    }
 
     @MainActor private var opening: Bool
     @MainActor private var terminal = false
@@ -34,10 +42,26 @@ final class RFCOMMChannelIO: NSObject, @unchecked Sendable {
         }
     }
 
+    // Priority writes (acknowledgments) go out before queued ordinary writes. Some headphones drop
+    // replies that wait too long for their acknowledgment.
     @MainActor
-    func write(_ data: Data, willSend: (@MainActor @Sendable () -> Bool)? = nil, completion: @escaping @MainActor @Sendable (IOReturn) -> Void) {
+    func write(_ data: Data, priority: Bool = false, willSend: (@MainActor @Sendable () -> Bool)? = nil,
+               completion: @escaping @MainActor @Sendable (IOReturn) -> Void) {
+        lock.withLock {
+            let write = PendingWrite(data: data, willSend: willSend, completion: completion)
+            if priority {
+                pendingWrites.insert(write, at: pendingPriorityWrites)
+                pendingPriorityWrites += 1
+            } else {
+                pendingWrites.append(write)
+            }
+        }
         writeQueue.async {
-            let retired = self.lock.withLock { self.retired }
+            let (retired, write) = self.lock.withLock {
+                if self.pendingPriorityWrites > 0 { self.pendingPriorityWrites -= 1 }
+                return (self.retired, self.pendingWrites.removeFirst())
+            }
+            let data = write.data, willSend = write.willSend, completion = write.completion
             guard !retired else {
                 DispatchQueue.main.async { completion(kIOReturnAborted) }
                 return

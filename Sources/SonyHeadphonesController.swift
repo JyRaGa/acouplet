@@ -6147,7 +6147,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
         classicWrites[identifier] = ClassicWrite(data: buffer, channel: channel, session: session, waitsForResponse: frame.type != 0x01,
                                                 timeout: timeout, completion: completion)
-        channelIO.write(data, willSend: { [weak self] in
+        channelIO.write(data, priority: frame.type == 0x01, willSend: { [weak self] in
             guard let self, self.channel === channel, self.controlSession == session,
                   let write = self.classicWrites[identifier] else { return false }
             guard isCurrent?() != false else {
